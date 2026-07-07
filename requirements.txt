@@ -4,3 +4,4 @@ sqlalchemy
 pandas
 openpyxl
 python-multipart
+psycopg2-binary
