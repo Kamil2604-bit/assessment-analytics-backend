@@ -6,12 +6,10 @@ from typing import List
 import pandas as pd
 import io
 
-# Import the database session and BOTH tables
 from models import SessionLocal, Feedback, AssessmentRecord
 
 app = FastAPI(title="GNIOT Analytics API")
 
-# Allow your frontend HTML file to communicate with this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -19,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Dependency to get the database session
 def get_db():
     db = SessionLocal()
     try:
@@ -27,27 +24,17 @@ def get_db():
     finally:
         db.close()
 
-# ==========================================
-# AUTHENTICATION ENDPOINT
-# ==========================================
-
 @app.post("/api/login")
 def login_user(data: dict):
     username = data.get("username")
     password = data.get("password")
     
-    # Define your secure credentials here
     if username == "kamil_admin" and password == "Admin@987":
         return {"status": "success", "role": "admin", "redirect": "dashboard"}
     elif username == "gniot_user" and password == "User@432":
         return {"status": "success", "role": "user", "redirect": "dashboard"}
     else:
         raise HTTPException(status_code=401, detail="Invalid Username or Password")
-
-
-# ==========================================
-# TRAINER FEEDBACK ENDPOINTS
-# ==========================================
 
 @app.post("/upload-feedback/")
 async def upload_feedback(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -65,11 +52,9 @@ async def upload_feedback(file: UploadFile = File(...), db: Session = Depends(ge
     ]
 
     records_added = 0
-
     for index, row in df.iterrows():
         for col_set in column_sets:
             if pd.notna(row.get(col_set["trainer"])):
-                
                 raw_date = row.get(col_set["date"])
                 parsed_date = datetime.now().date()
                 if pd.notna(raw_date):
@@ -87,26 +72,12 @@ async def upload_feedback(file: UploadFile = File(...), db: Session = Depends(ge
                 records_added += 1
 
     db.commit()
-    return {"message": f"Successfully processed and added {records_added} feedback records to the database!"}
+    return {"message": f"Successfully processed and added {records_added} feedback records!"}
 
 @app.get("/api/dashboard-data/")
 def get_dashboard_data(db: Session = Depends(get_db)):
     records = db.query(Feedback).all()
-    return [
-        {
-            "Trainer": r.trainer_name,
-            "Date": r.date.strftime("%Y-%m-%d"),
-            "Rating": r.rating,
-            "Subject": r.subject,
-            "Difficulties": r.difficulties,
-            "Remarks": r.remarks
-        } for r in records
-    ]
-
-
-# ==========================================
-# STUDENT ASSESSMENT ENDPOINTS 
-# ==========================================
+    return [{ "Trainer": r.trainer_name, "Date": r.date.strftime("%Y-%m-%d"), "Rating": r.rating, "Subject": r.subject, "Difficulties": r.difficulties, "Remarks": r.remarks } for r in records]
 
 @app.post("/upload-assessment/")
 async def upload_assessment(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
@@ -115,46 +86,37 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
 
     for file in files:
         if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
-            continue # Skip invalid files
+            continue 
 
-        # ATOMICITY FIX: Wipe old records from this specific file to ensure no duplicates
         db.query(AssessmentRecord).filter(AssessmentRecord.source_file == file.filename).delete()
         db.commit()
 
         contents = await file.read()
-        
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            df = pd.read_excel(io.BytesIO(contents), sheet_name=0)
+        df = pd.read_csv(io.BytesIO(contents)) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(contents), sheet_name=0)
 
         cols = df.columns
         name_col = next((c for c in cols if 'name' in str(c).lower()), None)
         roll_col = next((c for c in cols if 'roll' in str(c).lower()), None)
         dept_col = next((c for c in cols if 'department' in str(c).lower()), None)
-        
-        # TARGET SPECIFICALLY the "Percentage" column to avoid duplicate column readings
         pct_col = next((c for c in cols if 'percentage' in str(c).lower()), None)
-        
-        # FIND THE DATE by looking for the "Out of" column header (e.g., "02/07/2026 (Out of 30)")
         out_of_col = next((c for c in cols if 'out of' in str(c).lower()), None)
+        
+        # --- NEW COLUMN DETECTORS ---
+        link_col = next((c for c in cols if 'public report' in str(c).lower()), None)
+        conduct_col = next((c for c in cols if 'conduct metrics' in str(c).lower()), None)
 
         if not all([name_col, roll_col, pct_col]):
-            continue # Skip files missing core data
+            continue 
 
-        # Extract Date robustly
         parsed_date = datetime.now().date()
         if out_of_col:
             try:
-                # Extracts "02/07/2026" from "02/07/2026 (Out of 30)"
                 date_str = str(out_of_col).split('(')[0].strip()
-                # Parse format DD/MM/YYYY
                 parsed_date = pd.to_datetime(date_str, format="%d/%m/%Y").date()
-            except:
-                pass # Falls back to today if parsing fails
+            except: pass
 
         for index, row in df.iterrows():
-            roll_no = str(row[roll_col]) if pd.notna(row[roll_col]) else "Unknown"
+            roll_no = str(row[roll_col]).split('.')[0] if pd.notna(row[roll_col]) else "Unknown"
             name = str(row[name_col]) if pd.notna(row[name_col]) else "Unknown"
             dept = str(row[dept_col]) if pd.notna(row[dept_col]) else "Unknown"
 
@@ -165,20 +127,18 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
             if isinstance(score_val, str) and score_val.strip().upper() == 'ABSENT':
                 status = "Absent"
             elif pd.notna(score_val):
-                try:
-                    final_score = float(score_val)
-                except ValueError:
-                    continue 
-            else:
-                continue 
+                try: final_score = float(score_val)
+                except ValueError: continue 
+            else: continue 
+
+            # Parse Conduct & Link
+            conduct = str(row[conduct_col]).strip().upper() if conduct_col and pd.notna(row[conduct_col]) else "GENUINE"
+            report_url = str(row[link_col]).strip() if link_col and pd.notna(row[link_col]) else ""
 
             new_record = AssessmentRecord(
-                roll_no=roll_no,
-                name=name,
-                department=dept,
-                assessment_date=parsed_date,
-                score_percentage=final_score,
-                status=status,
+                roll_no=roll_no, name=name, department=dept,
+                assessment_date=parsed_date, score_percentage=final_score, status=status,
+                conduct_metrics=conduct, report_link=report_url,
                 source_file=file.filename  
             )
             db.add(new_record)
@@ -187,7 +147,7 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
         processed_files.append(file.filename)
         db.commit()
 
-    return {"message": f"Successfully processed {len(processed_files)} files. Synced {total_records_added} precise records to the database!"}
+    return {"message": f"Successfully processed {len(processed_files)} files. Synced {total_records_added} records to the database!"}
 
 @app.get("/api/assessments/")
 def get_all_assessments(db: Session = Depends(get_db)):
@@ -199,21 +159,14 @@ def get_all_assessments(db: Session = Depends(get_db)):
             "Department": r.department,
             "Date": r.assessment_date.strftime("%Y-%m-%d"),
             "Score": r.score_percentage,
-            "Status": r.status
+            "Status": r.status,
+            "Conduct": r.conduct_metrics,
+            "Link": r.report_link
         } for r in records
     ]
 
 @app.get("/api/student-history/{roll_no}")
 def get_student_history(roll_no: str, db: Session = Depends(get_db)):
     records = db.query(AssessmentRecord).filter(AssessmentRecord.roll_no == roll_no).order_by(AssessmentRecord.assessment_date).all()
-    
-    if not records:
-        raise HTTPException(status_code=404, detail="Student not found")
-        
-    return [
-        {
-            "Date": r.assessment_date.strftime("%Y-%m-%d"),
-            "Score": r.score_percentage,
-            "Status": r.status
-        } for r in records
-    ]
+    if not records: raise HTTPException(status_code=404, detail="Student not found")
+    return [{ "Date": r.assessment_date.strftime("%Y-%m-%d"), "Score": r.score_percentage, "Status": r.status, "Conduct": r.conduct_metrics, "Link": r.report_link } for r in records]
