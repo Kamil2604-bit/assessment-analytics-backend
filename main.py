@@ -97,7 +97,7 @@ async def upload_main(file: UploadFile = File(...), db: Session = Depends(get_db
         return {"message": f"Server Processing Error: {str(e)}"}
 
 # ==========================================
-# 2. DAILY ASSESSMENTS (Autonomous)
+# 2. DAILY ASSESSMENTS (Autonomous & Smart Fallback)
 # ==========================================
 @app.post("/upload-assessment/")
 async def upload_assessment(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
@@ -116,7 +116,7 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
             df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
             cols = df.columns
             
-            # Smart Scanners for dynamic MapIT outputs
+            # Smart Scanners
             roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration'])), None)
             if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id', 'uid']), None)
             
@@ -124,6 +124,10 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
             link_col = next((c for c in cols if 'public report' in str(c).lower() or 'link' in str(c).lower()), None)
             date_col = next((c for c in cols if 'out of' in str(c).lower() or 'started on' in str(c).lower()), None)
             conduct_col = next((c for c in cols if 'conduct metrics' in str(c).lower() or 'flagged' in str(c).lower()), None)
+            
+            # NEW: Fallback scanners for Name and Department directly inside the assessment file
+            name_col_assm = next((c for c in cols if 'name' in str(c).lower()), None)
+            dept_col_assm = next((c for c in cols if 'department' in str(c).lower() or 'dept' in str(c).lower() or 'branch' in str(c).lower()), None)
 
             if not roll_col or not pct_col: continue 
 
@@ -150,10 +154,24 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
                 conduct = str(row[conduct_col]).strip().upper() if conduct_col and pd.notna(row[conduct_col]) else "GENUINE"
                 report_url = str(row[link_col]).strip() if link_col and pd.notna(row[link_col]) else ""
                 
-                # Assign Department & Name autonomously from Master Registry memory
+                # --- SMART ASSIGNMENT LOGIC ---
                 student_data = roster_dict.get(raw_roll)
-                final_name = student_data["name"] if student_data else str(row.get('Candidate Name', 'Unknown'))
-                final_dept = student_data["dept"] if student_data else "General"
+                
+                # 1. Try Registry -> 2. Try Assessment File -> 3. Fallback to Unknown
+                if student_data and student_data["name"] and student_data["name"] != "Unknown":
+                    final_name = student_data["name"]
+                elif name_col_assm and pd.notna(row[name_col_assm]):
+                    final_name = str(row[name_col_assm]).strip()
+                else:
+                    final_name = "Unknown"
+                    
+                # 1. Try Registry -> 2. Try Assessment File -> 3. Fallback to General
+                if student_data and student_data["dept"] and student_data["dept"] != "General":
+                    final_dept = student_data["dept"]
+                elif dept_col_assm and pd.notna(row[dept_col_assm]):
+                    final_dept = str(row[dept_col_assm]).strip()
+                else:
+                    final_dept = "General"
 
                 db.add(AssessmentRecord(
                     roll_no=raw_roll, name=final_name, department=final_dept,
@@ -166,7 +184,6 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
         return {"message": f"Successfully processed {total_records_added} assessment records!"}
     except Exception as e:
         return {"message": f"Server Processing Error: {str(e)}"}
-
 # ==========================================
 # 3. DATA RETRIEVAL ENDPOINTS
 # ==========================================
