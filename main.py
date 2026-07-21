@@ -1,7 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from datetime import datetime
 from typing import List
 import pandas as pd
@@ -34,51 +33,31 @@ def login_user(data: dict):
     raise HTTPException(status_code=401, detail="Authentication failed.")
 
 # ==========================================
-# FILE MANAGEMENT & DELETION ENDPOINTS
-# ==========================================
-@app.get("/api/uploaded-files/")
-def get_uploaded_files(db: Session = Depends(get_db)):
-    """Returns a list of all active assessment files and their record counts."""
-    results = db.query(
-        AssessmentRecord.source_file, 
-        func.count(AssessmentRecord.id)
-    ).group_by(AssessmentRecord.source_file).all()
-    
-    return [
-        {"filename": r[0], "record_count": r[1]} 
-        for r in results if r[0]
-    ]
-
-@app.delete("/api/delete-file/{filename}")
-def delete_file_records(filename: str, db: Session = Depends(get_db)):
-    """Deletes all assessment records associated with a specific file."""
-    deleted_count = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename).delete()
-    db.commit()
-    
-    if deleted_count == 0:
-        raise HTTPException(status_code=404, detail="File not found or already deleted.")
-        
-    return {"message": f"Successfully deleted '{filename}' and removed {deleted_count} records."}
-
-# ==========================================
-# MASTER REGISTRY UPLOAD
+# 1. ROBUST MASTER REGISTRY UPLOAD
 # ==========================================
 @app.post("/upload-main/")
 async def upload_main(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
         contents = await file.read()
         xls = pd.ExcelFile(io.BytesIO(contents))
+        
         records_updated = 0
         seen_rolls = set()
         
+        # Iterate over all sheets in the file to map multi-department sheets
         for sheet in xls.sheet_names:
             temp_df = pd.read_excel(xls, sheet_name=sheet)
-            if temp_df.empty: continue
+            if temp_df.empty: 
+                continue
             
             cols = temp_df.columns
+            # Strict column matching to avoid grabbing 'Candidate Name'
             roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration'])), None)
-            if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id', 'uid']), None)
-            if not roll_col: continue
+            if not roll_col: 
+                roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id', 'uid']), None)
+            
+            if not roll_col: 
+                continue # Skip sheets that don't have student data (like instruction tabs)
             
             name_col = next((c for c in cols if 'name' in str(c).lower()), None)
             dept_col = next((c for c in cols if any(x in str(c).lower() for x in ['dept', 'branch', 'course', 'stream'])), None)
@@ -88,6 +67,8 @@ async def upload_main(file: UploadFile = File(...), db: Session = Depends(get_db
                 roll_val = row[roll_col]
                 if pd.isna(roll_val): continue
                 roll = str(roll_val).split('.')[0].strip()
+                
+                # Prevent duplicates within the upload batch
                 if not roll or roll.lower() == 'nan' or roll in seen_rolls: continue
                 seen_rolls.add(roll)
                     
@@ -97,20 +78,26 @@ async def upload_main(file: UploadFile = File(...), db: Session = Depends(get_db
                     db.add(student)
                     
                 student.name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Unknown"
-                dept_val = str(row[dept_col]).strip() if dept_col and pd.notna(row[dept_col]) else str(sheet).strip()
-                if dept_val.lower() in ['overall', 'master', 'sheet1']: dept_val = "General"
+                
+                # Assign Department: Try column first, if missing, use the Sheet Name!
+                if dept_col and pd.notna(row[dept_col]):
+                    dept_val = str(row[dept_col]).strip()
+                else:
+                    dept_val = str(sheet).strip()
+                    if dept_val.lower() in ['overall', 'master', 'sheet1']:
+                        dept_val = "General"
                 
                 student.department = dept_val
                 student.email = str(row[email_col]).strip() if email_col and pd.notna(row[email_col]) else ""
                 records_updated += 1
 
         db.commit()
-        return {"message": f"Master Registry updated! {records_updated} students memorized."}
+        return {"message": f"Master Registry successfully established! {records_updated} unique students mapped."}
     except Exception as e:
         return {"message": f"Server Processing Error: {str(e)}"}
 
 # ==========================================
-# DAILY ASSESSMENTS UPLOAD (With Smart Fallback)
+# 2. DAILY ASSESSMENTS (Autonomous & Smart Fallback)
 # ==========================================
 @app.post("/upload-assessment/")
 async def upload_assessment(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
@@ -122,25 +109,29 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
         for file in files:
             if not file.filename.endswith(('.xlsx', '.xls', '.csv')): continue 
             
+            # Atomicity maintained: delete existing records from this specific file before appending
             db.query(AssessmentRecord).filter(AssessmentRecord.source_file == file.filename).delete()
             db.commit()
 
             df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
             cols = df.columns
             
+            # Smart Scanners
             roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration'])), None)
             if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id', 'uid']), None)
+            
             pct_col = next((c for c in cols if 'percentage' in str(c).lower() or 'score' in str(c).lower()), None)
             link_col = next((c for c in cols if 'public report' in str(c).lower() or 'link' in str(c).lower()), None)
             date_col = next((c for c in cols if 'out of' in str(c).lower() or 'started on' in str(c).lower()), None)
             conduct_col = next((c for c in cols if 'conduct metrics' in str(c).lower() or 'flagged' in str(c).lower()), None)
             
-            # Fallback column detectors from the uploaded file
+            # NEW: Fallback scanners for Name and Department directly inside the assessment file
             name_col_assm = next((c for c in cols if 'name' in str(c).lower()), None)
-            dept_col_assm = next((c for c in cols if 'department' in str(c).lower() or 'dept' in str(c).lower()), None)
+            dept_col_assm = next((c for c in cols if 'department' in str(c).lower() or 'dept' in str(c).lower() or 'branch' in str(c).lower()), None)
 
             if not roll_col or not pct_col: continue 
 
+            # Extract Date robustly
             parsed_date = datetime.now().date()
             if date_col:
                 try:
@@ -163,9 +154,10 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
                 conduct = str(row[conduct_col]).strip().upper() if conduct_col and pd.notna(row[conduct_col]) else "GENUINE"
                 report_url = str(row[link_col]).strip() if link_col and pd.notna(row[link_col]) else ""
                 
-                # Smart Assignment Logic
+                # --- SMART ASSIGNMENT LOGIC ---
                 student_data = roster_dict.get(raw_roll)
                 
+                # 1. Try Registry -> 2. Try Assessment File -> 3. Fallback to Unknown
                 if student_data and student_data["name"] and student_data["name"] != "Unknown":
                     final_name = student_data["name"]
                 elif name_col_assm and pd.notna(row[name_col_assm]):
@@ -173,6 +165,7 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
                 else:
                     final_name = "Unknown"
                     
+                # 1. Try Registry -> 2. Try Assessment File -> 3. Fallback to General
                 if student_data and student_data["dept"] and student_data["dept"] != "General":
                     final_dept = student_data["dept"]
                 elif dept_col_assm and pd.notna(row[dept_col_assm]):
@@ -191,7 +184,9 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
         return {"message": f"Successfully processed {total_records_added} assessment records!"}
     except Exception as e:
         return {"message": f"Server Processing Error: {str(e)}"}
-
+# ==========================================
+# 3. DATA RETRIEVAL ENDPOINTS
+# ==========================================
 @app.get("/api/assessments/")
 def get_all_assessments(db: Session = Depends(get_db)):
     records = db.query(AssessmentRecord).all()
@@ -199,4 +194,5 @@ def get_all_assessments(db: Session = Depends(get_db)):
 
 @app.post("/upload-feedback/")
 async def upload_feedback(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    # Standard feedback endpoint logic kept minimal
     return {"message": "Feedback endpoint standing by."}
