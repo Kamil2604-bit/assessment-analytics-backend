@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -7,136 +7,121 @@ from typing import List
 import pandas as pd
 import io
 
-from models import SessionLocal, AssessmentRecord, Feedback, StudentRoster
+from models import SessionLocal, AssessmentRecord, StudentRoster, ClientAccount
 
-app = FastAPI(title="GNIOT Master Analytics Engine")
+app = FastAPI(title="Master SaaS Analytics Engine")
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
+# Auto-Create Super Admin on Startup
+@app.on_event("startup")
+def startup_event():
+    db = SessionLocal()
+    super_admin = db.query(ClientAccount).filter(ClientAccount.username == "admin").first()
+    if not super_admin:
+        db.add(ClientAccount(username="admin", password="Admin@123", role="super_admin", institute="ALL", display_name="Super Admin"))
+        # Add a default demo client so the interface isn't completely empty initially
+        db.add(ClientAccount(username="gniot_admin", password="Gniot@123", role="client_admin", institute="GNIOT", display_name="GNIOT"))
+        db.commit()
+    db.close()
+
+# ==========================================
+# AUTH & CLIENT MANAGEMENT
+# ==========================================
 @app.post("/api/login")
-def login_user(data: dict):
-    if data.get("username") == "admin" and data.get("password") == "Admin@123":
-        return {"status": "success", "role": "admin"}
-    elif data.get("username") == "user" and data.get("password") == "User@123":
-        return {"status": "success", "role": "user"}
+def login_user(data: dict, db: Session = Depends(get_db)):
+    user = db.query(ClientAccount).filter(ClientAccount.username == data.get("username"), ClientAccount.password == data.get("password")).first()
+    if user:
+        return {"status": "success", "role": user.role, "institute": user.institute, "display": user.display_name}
     raise HTTPException(status_code=401, detail="Authentication failed.")
 
+@app.get("/api/institutes/")
+def get_institutes(db: Session = Depends(get_db)):
+    """Returns a list of all active institutes in the database."""
+    institutes = db.query(ClientAccount.institute).filter(ClientAccount.institute != "ALL").distinct().all()
+    return [i[0] for i in institutes]
+
+@app.post("/api/create-client/")
+def create_client(data: dict, db: Session = Depends(get_db)):
+    """Allows Super Admin to create a new Institute & Login directly from the Dashboard."""
+    existing = db.query(ClientAccount).filter(ClientAccount.username == data.get("username")).first()
+    if existing: raise HTTPException(status_code=400, detail="Username already exists!")
+    
+    new_client = ClientAccount(
+        username=data.get("username"),
+        password=data.get("password"),
+        role="client_admin", 
+        institute=str(data.get("institute")).upper().strip(),
+        display_name=str(data.get("institute")).upper().strip()
+    )
+    db.add(new_client)
+    db.commit()
+    return {"message": f"Successfully created workspace for {new_client.institute}!"}
+
 # ==========================================
-# FILE MANAGEMENT & SYSTEM RESET ENDPOINTS
+# DATA ENDPOINTS (Multi-Tenant filtered)
 # ==========================================
 @app.get("/api/uploaded-files/")
-def get_uploaded_files(db: Session = Depends(get_db)):
-    """Returns a list of all active assessment files and their record counts."""
-    results = db.query(
-        AssessmentRecord.source_file, 
-        func.count(AssessmentRecord.id)
-    ).group_by(AssessmentRecord.source_file).all()
-    
-    return [{"filename": r[0], "record_count": r[1]} for r in results if r[0]]
+def get_uploaded_files(institute: str, db: Session = Depends(get_db)):
+    query = db.query(AssessmentRecord.source_file, func.count(AssessmentRecord.id)).group_by(AssessmentRecord.source_file)
+    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
+    return [{"filename": r[0], "record_count": r[1]} for r in query.all() if r[0]]
+
+@app.get("/api/assessments/")
+def get_all_assessments(institute: str, db: Session = Depends(get_db)):
+    query = db.query(AssessmentRecord)
+    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
+    records = query.all()
+    return [{ "Roll No": r.roll_no, "Name": r.name, "Department": r.department, "Date": r.assessment_date.strftime("%Y-%m-%d"), "Score": r.score_percentage, "Status": r.status, "Conduct": r.conduct_metrics, "Link": r.report_link } for r in records]
 
 @app.delete("/api/delete-file/{filename}")
-def delete_file_records(filename: str, db: Session = Depends(get_db)):
-    """Deletes all assessment records associated with a specific file."""
-    deleted_count = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename).delete()
+def delete_file_records(filename: str, institute: str, db: Session = Depends(get_db)):
+    query = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename)
+    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
+    deleted_count = query.delete()
     db.commit()
-    if deleted_count == 0:
-        raise HTTPException(status_code=404, detail="File not found.")
-    return {"message": f"Successfully deleted '{filename}' and removed {deleted_count} records."}
+    return {"message": f"Successfully deleted '{filename}'."}
 
 @app.delete("/api/reset-database/")
-def reset_database(db: Session = Depends(get_db)):
-    """Wipes all assessment records for a completely fresh start."""
-    deleted_count = db.query(AssessmentRecord).delete()
+def reset_database(institute: str, db: Session = Depends(get_db)):
+    query = db.query(AssessmentRecord)
+    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
+    deleted_count = query.delete()
     db.commit()
-    return {"message": f"Factory Reset Successful! {deleted_count} assessment records have been permanently erased."}
+    return {"message": f"Reset Successful! {deleted_count} assessment records erased."}
 
 # ==========================================
-# MASTER REGISTRY UPLOAD
-# ==========================================
-@app.post("/upload-main/")
-async def upload_main(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    try:
-        contents = await file.read()
-        xls = pd.ExcelFile(io.BytesIO(contents))
-        records_updated = 0
-        seen_rolls = set()
-        
-        for sheet in xls.sheet_names:
-            temp_df = pd.read_excel(xls, sheet_name=sheet)
-            if temp_df.empty: continue
-            
-            cols = temp_df.columns
-            roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration'])), None)
-            if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id', 'uid']), None)
-            if not roll_col: continue
-            
-            name_col = next((c for c in cols if 'name' in str(c).lower()), None)
-            dept_col = next((c for c in cols if any(x in str(c).lower() for x in ['dept', 'branch', 'course', 'stream'])), None)
-            email_col = next((c for c in cols if 'email' in str(c).lower()), None)
-
-            for index, row in temp_df.iterrows():
-                roll_val = row[roll_col]
-                if pd.isna(roll_val): continue
-                roll = str(roll_val).split('.')[0].strip()
-                if not roll or roll.lower() == 'nan' or roll in seen_rolls: continue
-                seen_rolls.add(roll)
-                    
-                student = db.query(StudentRoster).filter(StudentRoster.roll_no == roll).first()
-                if not student:
-                    student = StudentRoster(roll_no=roll)
-                    db.add(student)
-                    
-                student.name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Unknown"
-                dept_val = str(row[dept_col]).strip() if dept_col and pd.notna(row[dept_col]) else str(sheet).strip()
-                if dept_val.lower() in ['overall', 'master', 'sheet1']: dept_val = "General"
-                
-                student.department = dept_val
-                student.email = str(row[email_col]).strip() if email_col and pd.notna(row[email_col]) else ""
-                records_updated += 1
-
-        db.commit()
-        return {"message": f"Master Registry updated! {records_updated} students memorized."}
-    except Exception as e:
-        return {"message": f"Server Processing Error: {str(e)}"}
-
-# ==========================================
-# DAILY ASSESSMENTS UPLOAD
+# UPLOAD ENGINE
 # ==========================================
 @app.post("/upload-assessment/")
-async def upload_assessment(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def upload_assessment(institute: str = Form(...), files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+    if institute == "ALL": return {"message": "Error: You must select a specific institute."}
     try:
         total_records_added = 0
-        roster_records = db.query(StudentRoster).all()
+        roster_records = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
         roster_dict = {r.roll_no: {"name": r.name, "dept": r.department} for r in roster_records}
 
         for file in files:
             if not file.filename.endswith(('.xlsx', '.xls', '.csv')): continue 
-            
-            db.query(AssessmentRecord).filter(AssessmentRecord.source_file == file.filename).delete()
+            db.query(AssessmentRecord).filter(AssessmentRecord.source_file == file.filename, AssessmentRecord.institute == institute).delete()
             db.commit()
 
             df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
             cols = df.columns
             
             roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration'])), None)
-            if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id', 'uid']), None)
+            if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id']), None)
             pct_col = next((c for c in cols if 'percentage' in str(c).lower() or 'score' in str(c).lower()), None)
             link_col = next((c for c in cols if 'public report' in str(c).lower() or 'link' in str(c).lower()), None)
             date_col = next((c for c in cols if 'out of' in str(c).lower() or 'started on' in str(c).lower()), None)
             conduct_col = next((c for c in cols if 'conduct metrics' in str(c).lower() or 'flagged' in str(c).lower()), None)
-            
             name_col_assm = next((c for c in cols if 'name' in str(c).lower()), None)
             dept_col_assm = next((c for c in cols if 'department' in str(c).lower() or 'dept' in str(c).lower()), None)
 
@@ -165,22 +150,11 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
                 report_url = str(row[link_col]).strip() if link_col and pd.notna(row[link_col]) else ""
                 
                 student_data = roster_dict.get(raw_roll)
-                
-                if student_data and student_data["name"] and student_data["name"] != "Unknown":
-                    final_name = student_data["name"]
-                elif name_col_assm and pd.notna(row[name_col_assm]):
-                    final_name = str(row[name_col_assm]).strip()
-                else:
-                    final_name = "Unknown"
-                    
-                if student_data and student_data["dept"] and student_data["dept"] != "General":
-                    final_dept = student_data["dept"]
-                elif dept_col_assm and pd.notna(row[dept_col_assm]):
-                    final_dept = str(row[dept_col_assm]).strip()
-                else:
-                    final_dept = "General"
+                final_name = student_data["name"] if student_data and student_data["name"] != "Unknown" else (str(row[name_col_assm]).strip() if name_col_assm and pd.notna(row[name_col_assm]) else "Unknown")
+                final_dept = student_data["dept"] if student_data and student_data["dept"] != "General" else (str(row[dept_col_assm]).strip() if dept_col_assm and pd.notna(row[dept_col_assm]) else "General")
 
                 db.add(AssessmentRecord(
+                    institute=institute,
                     roll_no=raw_roll, name=final_name, department=final_dept,
                     assessment_date=parsed_date, score_percentage=final_score, status=status,
                     conduct_metrics=conduct, report_link=report_url,
@@ -188,15 +162,6 @@ async def upload_assessment(files: List[UploadFile] = File(...), db: Session = D
                 ))
                 total_records_added += 1
             db.commit()
-        return {"message": f"Successfully processed {total_records_added} assessment records!"}
+        return {"message": f"Successfully processed {total_records_added} assessment records for {institute}!"}
     except Exception as e:
-        return {"message": f"Server Processing Error: {str(e)}"}
-
-@app.get("/api/assessments/")
-def get_all_assessments(db: Session = Depends(get_db)):
-    records = db.query(AssessmentRecord).all()
-    return [{ "Roll No": r.roll_no, "Name": r.name, "Department": r.department, "Date": r.assessment_date.strftime("%Y-%m-%d"), "Score": r.score_percentage, "Status": r.status, "Conduct": r.conduct_metrics, "Link": r.report_link } for r in records]
-
-@app.post("/upload-feedback/")
-async def upload_feedback(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    return {"message": "Feedback endpoint standing by."}
+        return {"message": f"Server Error: {str(e)}"}
