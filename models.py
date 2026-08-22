@@ -14,21 +14,15 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# ==========================================
-# NEW: DYNAMIC CLIENT ACCOUNT TABLE
-# ==========================================
 class ClientAccount(Base):
     __tablename__ = "client_accounts"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     password = Column(String)
-    role = Column(String)       # 'super_admin', 'client_admin', or 'client_user'
-    institute = Column(String)  # e.g., 'ALL', 'GNIOT', 'SRM'
+    role = Column(String)       
+    institute = Column(String)  
     display_name = Column(String)
 
-# ==========================================
-# DATA TABLES
-# ==========================================
 class StudentRoster(Base):
     __tablename__ = "student_roster"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -51,5 +45,16 @@ class AssessmentRecord(Base):
     source_file = Column(String, index=True) 
     conduct_metrics = Column(String, nullable=True, default="GENUINE")
     report_link = Column(String, nullable=True)
+
+class CommunicationConfig(Base):
+    __tablename__ = "comms_config"
+    id = Column(Integer, primary_key=True, index=True)
+    institute = Column(String, unique=True, index=True)
+    sender_email = Column(String)
+    sender_password = Column(String)
+    frequency = Column(String)
+    cc_emails = Column(String)
+    bcc_emails = Column(String)
+    email_template = Column(String)
 
 Base.metadata.create_all(bind=engine)
