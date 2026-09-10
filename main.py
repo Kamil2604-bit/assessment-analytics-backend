@@ -11,7 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 
-from models import SessionLocal, AssessmentRecord, StudentRoster, ClientAccount, CommunicationConfig
+from models import SessionLocal, AssessmentRecord, StudentRoster, ClientAccount, CommunicationConfig, TrainerFeedbackRecord
 
 app = FastAPI(title="Master SaaS Analytics Engine")
 
@@ -31,9 +31,13 @@ def startup_event():
     if not super_admin:
         db.add(ClientAccount(username="admin", password="Admin@123", role="super_admin", institute="ALL", display_name="Super Admin"))
         db.add(ClientAccount(username="gniot_admin", password="Gniot@123", role="client_admin", institute="GNIOT", display_name="GNIOT"))
+        db.add(ClientAccount(username="srm_admin", password="Srm@123", role="client_admin", institute="SRM", display_name="SRM"))
         db.commit()
     db.close()
 
+# ==========================================
+# AUTH & CLIENT MANAGEMENT
+# ==========================================
 @app.post("/api/login")
 def login_user(data: dict, db: Session = Depends(get_db)):
     user = db.query(ClientAccount).filter(ClientAccount.username == data.get("username"), ClientAccount.password == data.get("password")).first()
@@ -57,43 +61,64 @@ def create_client(data: dict, db: Session = Depends(get_db)):
     db.commit()
     return {"message": f"Successfully created workspace for {new_client.institute}!"}
 
+# ==========================================
+# ASSESSMENT DATA PIPELINE
+# ==========================================
 @app.get("/api/uploaded-files/")
 def get_uploaded_files(institute: str, db: Session = Depends(get_db)):
-    query = db.query(AssessmentRecord.source_file, func.count(AssessmentRecord.id)).group_by(AssessmentRecord.source_file)
-    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
-    return [{"filename": r[0], "record_count": r[1]} for r in query.all() if r[0]]
+    assm_q = db.query(AssessmentRecord.source_file, func.count(AssessmentRecord.id)).group_by(AssessmentRecord.source_file)
+    fb_q = db.query(TrainerFeedbackRecord.source_file, func.count(TrainerFeedbackRecord.id)).group_by(TrainerFeedbackRecord.source_file)
+    if institute != "ALL":
+        assm_q = assm_q.filter(AssessmentRecord.institute == institute)
+        fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
+    
+    files = [{"filename": r[0], "record_count": r[1], "type": "Assessment"} for r in assm_q.all() if r[0]]
+    files.extend([{"filename": r[0], "record_count": r[1], "type": "Feedback"} for r in fb_q.all() if r[0]])
+    return files
 
 @app.get("/api/assessments/")
 def get_all_assessments(institute: str, db: Session = Depends(get_db)):
     query = db.query(AssessmentRecord)
     if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
     records = query.all()
-    return [{ "Roll No": r.roll_no, "Name": r.name, "Department": r.department, "Date": r.assessment_date.strftime("%Y-%m-%d"), "Score": r.score_percentage, "Status": r.status, "Conduct": r.conduct_metrics, "Link": r.report_link } for r in records]
+    return [{ 
+        "Roll No": r.roll_no, "Name": r.name, "Department": r.department, "Section": r.section or "General",
+        "Date": r.assessment_date.strftime("%Y-%m-%d"), "Score": r.score_percentage, 
+        "Status": r.status, "Conduct": r.conduct_metrics, "Link": r.report_link 
+    } for r in records]
 
 @app.delete("/api/delete-file/{filename}")
 def delete_file_records(filename: str, institute: str, db: Session = Depends(get_db)):
-    query = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename)
-    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
-    query.delete()
+    assm_q = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename)
+    fb_q = db.query(TrainerFeedbackRecord).filter(TrainerFeedbackRecord.source_file == filename)
+    if institute != "ALL":
+        assm_q = assm_q.filter(AssessmentRecord.institute == institute)
+        fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
+    d1 = assm_q.delete()
+    d2 = fb_q.delete()
     db.commit()
-    return {"message": f"Successfully deleted '{filename}'."}
+    return {"message": f"Successfully deleted '{filename}' ({d1 + d2} records removed)."}
 
 @app.delete("/api/reset-database/")
 def reset_database(institute: str, db: Session = Depends(get_db)):
-    query = db.query(AssessmentRecord)
-    if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
-    deleted_count = query.delete()
+    q1 = db.query(AssessmentRecord)
+    q2 = db.query(TrainerFeedbackRecord)
+    q3 = db.query(StudentRoster)
+    if institute != "ALL":
+        q1 = q1.filter(AssessmentRecord.institute == institute)
+        q2 = q2.filter(TrainerFeedbackRecord.institute == institute)
+        q3 = q3.filter(StudentRoster.institute == institute)
+    d1 = q1.delete()
+    d2 = q2.delete()
+    d3 = q3.delete()
     db.commit()
-    return {"message": f"Reset Successful! {deleted_count} assessment records erased."}
+    return {"message": f"Reset Complete! Cleared {d1} assessments, {d2} feedback records, and {d3} roster entries."}
 
 @app.post("/upload-assessment/")
 async def upload_assessment(institute: str = Form(...), files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
     if institute == "ALL": return {"message": "Error: You must select a specific institute."}
     try:
         total_records_added = 0
-        roster_records = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
-        roster_dict = {r.roll_no: {"name": r.name, "dept": r.department} for r in roster_records}
-
         for file in files:
             if not file.filename.endswith(('.xlsx', '.xls', '.csv')): continue 
             db.query(AssessmentRecord).filter(AssessmentRecord.source_file == file.filename, AssessmentRecord.institute == institute).delete()
@@ -108,8 +133,10 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
             link_col = next((c for c in cols if 'public report' in str(c).lower() or 'link' in str(c).lower()), None)
             date_col = next((c for c in cols if 'out of' in str(c).lower() or 'started on' in str(c).lower()), None)
             conduct_col = next((c for c in cols if 'conduct metrics' in str(c).lower() or 'flagged' in str(c).lower()), None)
-            name_col_assm = next((c for c in cols if 'name' in str(c).lower()), None)
-            dept_col_assm = next((c for c in cols if 'department' in str(c).lower() or 'dept' in str(c).lower()), None)
+            name_col = next((c for c in cols if 'name' in str(c).lower()), None)
+            dept_col = next((c for c in cols if 'department' in str(c).lower() or 'branch' in str(c).lower() or 'dept' in str(c).lower()), None)
+            sec_col = next((c for c in cols if 'section' in str(c).lower() or 'sec' in str(c).lower()), None)
+            email_col = next((c for c in cols if 'email' in str(c).lower()), None)
 
             if not roll_col or not pct_col: continue 
 
@@ -120,7 +147,7 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                     parsed_date = pd.to_datetime(date_str, format="%d/%m/%Y").date()
                 except: pass
 
-            for index, row in df.iterrows():
+            for _, row in df.iterrows():
                 raw_roll = str(row[roll_col]).split('.')[0].strip() if pd.notna(row[roll_col]) else "Unknown"
                 score_val = row[pct_col]
                 if pd.isna(score_val): continue
@@ -134,14 +161,24 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
 
                 conduct = str(row[conduct_col]).strip().upper() if conduct_col and pd.notna(row[conduct_col]) else "GENUINE"
                 report_url = str(row[link_col]).strip() if link_col and pd.notna(row[link_col]) else ""
-                
-                student_data = roster_dict.get(raw_roll)
-                final_name = student_data["name"] if student_data and student_data["name"] != "Unknown" else (str(row[name_col_assm]).strip() if name_col_assm and pd.notna(row[name_col_assm]) else "Unknown")
-                final_dept = student_data["dept"] if student_data and student_data["dept"] != "General" else (str(row[dept_col_assm]).strip() if dept_col_assm and pd.notna(row[dept_col_assm]) else "General")
+                final_name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Unknown"
+                final_dept = str(row[dept_col]).strip() if dept_col and pd.notna(row[dept_col]) else "General"
+                final_sec = str(row[sec_col]).strip() if sec_col and pd.notna(row[sec_col]) else "General"
+                final_email = str(row[email_col]).strip() if email_col and pd.notna(row[email_col]) else ""
 
+                student = db.query(StudentRoster).filter(StudentRoster.roll_no == raw_roll, StudentRoster.institute == institute).first()
+                if not student:
+                    student = StudentRoster(institute=institute, roll_no=raw_roll, name=final_name, department=final_dept, section=final_sec, email=final_email)
+                    db.add(student)
+                else:
+                    if final_name != "Unknown": student.name = final_name
+                    if final_dept != "General": student.department = final_dept
+                    if final_sec != "General": student.section = final_sec
+                    if final_email and "@" in final_email: student.email = final_email
+                
                 db.add(AssessmentRecord(
-                    institute=institute, roll_no=raw_roll, name=final_name, department=final_dept,
-                    assessment_date=parsed_date, score_percentage=final_score, status=status,
+                    institute=institute, roll_no=raw_roll, name=student.name, department=student.department,
+                    section=student.section, assessment_date=parsed_date, score_percentage=final_score, status=status,
                     conduct_metrics=conduct, report_link=report_url, source_file=file.filename  
                 ))
                 total_records_added += 1
@@ -151,7 +188,119 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
         return {"message": f"Server Error: {str(e)}"}
 
 # ==========================================
-# EMAIL & COMMUNICATION ENGINE (100% UI DRIVEN)
+# TRAINER FEEDBACK DATA PIPELINE
+# ==========================================
+@app.post("/upload-feedback/")
+async def upload_feedback(institute: str = Form(...), files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+    if institute == "ALL": return {"message": "Error: Select a specific institute for feedback upload."}
+    try:
+        total_feedback_added = 0
+        for file in files:
+            if not file.filename.endswith(('.xlsx', '.xls', '.csv')): continue
+            db.query(TrainerFeedbackRecord).filter(TrainerFeedbackRecord.source_file == file.filename, TrainerFeedbackRecord.institute == institute).delete()
+            db.commit()
+
+            df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
+            cols = df.columns
+            
+            ts_col = next((c for c in cols if 'timestamp' in str(c).lower()), None)
+            name_col = next((c for c in cols if str(c).strip().lower() in ['name', 'participant name', 'student name']), None)
+            reg_col = next((c for c in cols if any(x in str(c).lower() for x in ['registration', 'roll', 'prn', 'reg'])), None)
+            sec_col = next((c for c in cols if 'section' in str(c).lower() or 'sec' in str(c).lower()), None)
+            trainer_col = next((c for c in cols if any(x in str(c).lower() for x in ['trainer name', 'trainer', 'instructor', 'faculty'])), None)
+            rating_col = next((c for c in cols if any(x in str(c).lower() for x in ['rate today', 'rating', 'score (1-5)'])), None)
+            und_col = next((c for c in cols if 'understand' in str(c).lower()), None)
+            clarity_col = next((c for c in cols if 'explain' in str(c).lower() or 'clarity' in str(c).lower() or 'recommend' in str(c).lower()), None)
+            pace_col = next((c for c in cols if 'pace' in str(c).lower()), None)
+            diff_col = next((c for c in cols if any(x in str(c).lower() for x in ['issues', 'doubts', 'difficulties', 'comments'])), None)
+            sugg_col = next((c for c in cols if 'suggestion' in str(c).lower() or 'improvement' in str(c).lower()), None)
+
+            # Auto-infer stack from filename if not inside columns
+            fn_lower = file.filename.lower()
+            inferred_stack = "General"
+            if "cyber" in fn_lower: inferred_stack = "Cyber Security"
+            elif "data science" in fn_lower or "dsml" in fn_lower: inferred_stack = "Data Science & ML"
+            elif "java" in fn_lower: inferred_stack = "Java Full Stack"
+            elif "mern" in fn_lower: inferred_stack = "MERN Stack"
+
+            for _, row in df.iterrows():
+                # Parse timestamp
+                parsed_ts = datetime.now()
+                if ts_col and pd.notna(row[ts_col]):
+                    try: parsed_ts = pd.to_datetime(str(row[ts_col]))
+                    except: pass
+                
+                # Parse rating (numeric 1-5 or string label)
+                num_rating = None
+                rating_lbl = ""
+                if rating_col and pd.notna(row[rating_col]):
+                    val = row[rating_col]
+                    try:
+                        num_rating = float(val)
+                    except:
+                        rating_lbl = str(val).strip()
+                        if "excel" in rating_lbl.lower(): num_rating = 5.0
+                        elif "good" in rating_lbl.lower(): num_rating = 4.0
+                        elif "avg" in rating_lbl.lower() or "average" in rating_lbl.lower(): num_rating = 3.0
+                        elif "poor" in rating_lbl.lower(): num_rating = 2.0
+                        else: num_rating = 3.0
+
+                trainer = str(row[trainer_col]).strip() if trainer_col and pd.notna(row[trainer_col]) else "Assigned Faculty"
+                sec = str(row[sec_col]).strip() if sec_col and pd.notna(row[sec_col]) else "General"
+                st_name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Anonymous"
+                st_reg = str(row[reg_col]).strip() if reg_col and pd.notna(row[reg_col]) else ""
+                und = str(row[und_col]).strip() if und_col and pd.notna(row[und_col]) else ""
+                clarity = str(row[clarity_col]).strip() if clarity_col and pd.notna(row[clarity_col]) else ""
+                pace = str(row[pace_col]).strip() if pace_col and pd.notna(row[pace_col]) else ""
+                diff = str(row[diff_col]).strip() if diff_col and pd.notna(row[diff_col]) and str(row[diff_col]).lower() not in ['no', 'none', 'nil', 'nan', 'na', '.'] else ""
+                sugg = str(row[sugg_col]).strip() if sugg_col and pd.notna(row[sugg_col]) and str(row[sugg_col]).lower() not in ['no', 'none', 'nil', 'nan', 'na', '.'] else ""
+
+                db.add(TrainerFeedbackRecord(
+                    institute=institute,
+                    submission_timestamp=parsed_ts,
+                    stack=inferred_stack,
+                    trainer_name=trainer,
+                    section=sec,
+                    student_reg_no=st_reg,
+                    student_name=st_name,
+                    rating=num_rating,
+                    rating_label=rating_lbl,
+                    understanding=und,
+                    clarity=clarity,
+                    pace=pace,
+                    difficulties=diff,
+                    suggestions=sugg,
+                    source_file=file.filename
+                ))
+                total_feedback_added += 1
+            db.commit()
+        return {"message": f"Successfully ingested {total_feedback_added} trainer feedback records for {institute}!"}
+    except Exception as e:
+        return {"message": f"Server Error: {str(e)}"}
+
+@app.get("/api/feedbacks/")
+def get_feedbacks(institute: str, db: Session = Depends(get_db)):
+    query = db.query(TrainerFeedbackRecord)
+    if institute != "ALL": query = query.filter(TrainerFeedbackRecord.institute == institute)
+    records = query.all()
+    return [{
+        "Date": r.submission_timestamp.strftime("%Y-%m-%d"),
+        "Time": r.submission_timestamp.strftime("%H:%M:%S"),
+        "Stack": r.stack,
+        "Trainer": r.trainer_name,
+        "Section": r.section or "General",
+        "Student": r.student_name or "Anonymous",
+        "RegNo": r.student_reg_no or "-",
+        "Rating": r.rating or 0,
+        "Understanding": r.understanding or "-",
+        "Clarity": r.clarity or "-",
+        "Pace": r.pace or "-",
+        "Difficulties": r.difficulties or "-",
+        "Suggestions": r.suggestions or "-"
+    } for r in records]
+
+# ==========================================
+# EMAIL & CONFIGURATION GATEWAY
 # ==========================================
 @app.post("/api/comms-config/")
 def save_comms_config(data: dict, db: Session = Depends(get_db)):
@@ -160,15 +309,15 @@ def save_comms_config(data: dict, db: Session = Depends(get_db)):
     if not config:
         config = CommunicationConfig(institute=institute)
         db.add(config)
-    
     config.sender_email = data.get("sender_email", "")
     config.sender_password = data.get("sender_password", "")
     config.frequency = data.get("frequency", "")
     config.cc_emails = data.get("cc", "")
     config.bcc_emails = data.get("bcc", "")
     config.email_template = data.get("template", "")
+    config.google_sheet_url = data.get("google_sheet_url", "")
     db.commit()
-    return {"message": "Communication settings successfully saved!"}
+    return {"message": "Communication & live sync configurations successfully locked in!"}
 
 @app.get("/api/comms-config/")
 def get_comms_config(institute: str, db: Session = Depends(get_db)):
@@ -176,22 +325,31 @@ def get_comms_config(institute: str, db: Session = Depends(get_db)):
     if config: 
         return {
             "sender_email": config.sender_email, "sender_password": config.sender_password,
-            "frequency": config.frequency, "cc": config.cc_emails, "bcc": config.bcc_emails, "template": config.email_template
+            "frequency": config.frequency, "cc": config.cc_emails, "bcc": config.bcc_emails, 
+            "template": config.email_template, "google_sheet_url": config.google_sheet_url or ""
         }
     return {
         "sender_email": "", "sender_password": "", "frequency": "Weekly (Friday 5:00 PM)", 
-        "cc": "", "bcc": "", "template": "Dear {Student_Name},\n\nYour average score is {Score_Avg}%. Attached is your Scorecard.\n\nRegards,\nAdmin"
+        "cc": "", "bcc": "", "template": "Dear {Student_Name},\n\nYour average score is {Score_Avg}%. Attached is your Scorecard.\n\nRegards,\nAdmin",
+        "google_sheet_url": ""
     }
 
 @app.post("/api/trigger-emails/")
-def trigger_automated_emails(institute: str, db: Session = Depends(get_db)):
+def trigger_automated_emails(institute: str, target_date: str = None, db: Session = Depends(get_db)):
     config = db.query(CommunicationConfig).filter(CommunicationConfig.institute == institute).first()
     if not config or not config.sender_email or not config.sender_password: 
-        return {"message": "Error: You must configure your Sender Email and App Password in the dashboard first."}
+        return {"message": "Error: Sender Email and App Password must be configured in settings first."}
     
     students = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
-    records = db.query(AssessmentRecord).filter(AssessmentRecord.institute == institute).all()
-    df = pd.DataFrame([{ "Roll No": r.roll_no, "Name": r.name, "Date": r.assessment_date, "Score": r.score_percentage, "Status": r.status } for r in records])
+    query = db.query(AssessmentRecord).filter(AssessmentRecord.institute == institute)
+    if target_date:
+        try:
+            p_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+            query = query.filter(AssessmentRecord.assessment_date == p_date)
+        except: pass
+        
+    records = query.all()
+    df = pd.DataFrame([{ "Roll No": r.roll_no, "Name": r.name, "Department": r.department, "Section": r.section, "Date": r.assessment_date, "Score": r.score_percentage, "Status": r.status, "Conduct": r.conduct_metrics, "Report Link": r.report_link } for r in records])
     
     emails_sent = 0
     try:
@@ -231,4 +389,4 @@ def trigger_automated_emails(institute: str, db: Session = Depends(get_db)):
         server.quit()
         return {"message": f"Success! Dispatched {emails_sent} automated scorecards using {config.sender_email}."}
     except Exception as e:
-        return {"message": f"Email System Error. Verify your App Password and try again. Error: {str(e)}"}
+        return {"message": f"Email System Error: {str(e)}"}
