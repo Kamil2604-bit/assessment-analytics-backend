@@ -127,16 +127,20 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
             df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
             cols = df.columns
             
-            roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration'])), None)
+            # UPDATED MAPPINGS FOR SRM FORMAT
+            roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration', 'register'])), None)
             if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id']), None)
             pct_col = next((c for c in cols if 'percentage' in str(c).lower() or 'score' in str(c).lower()), None)
             link_col = next((c for c in cols if 'public report' in str(c).lower() or 'link' in str(c).lower()), None)
             date_col = next((c for c in cols if 'out of' in str(c).lower() or 'started on' in str(c).lower()), None)
             conduct_col = next((c for c in cols if 'conduct metrics' in str(c).lower() or 'flagged' in str(c).lower()), None)
             name_col = next((c for c in cols if 'name' in str(c).lower()), None)
-            dept_col = next((c for c in cols if 'department' in str(c).lower() or 'branch' in str(c).lower() or 'dept' in str(c).lower()), None)
-            sec_col = next((c for c in cols if 'section' in str(c).lower() or 'sec' in str(c).lower()), None)
             email_col = next((c for c in cols if 'email' in str(c).lower()), None)
+            
+            # Detect standalone OR combined branch/section columns
+            dept_col = next((c for c in cols if str(c).lower() in ['department', 'dept', 'branch']), None)
+            sec_col = next((c for c in cols if 'section' in str(c).lower() and 'branch' not in str(c).lower()), None)
+            combined_branch_sec_col = next((c for c in cols if 'branch' in str(c).lower() and 'section' in str(c).lower()), None)
 
             if not roll_col or not pct_col: continue 
 
@@ -148,23 +152,35 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                 except: pass
 
             for _, row in df.iterrows():
-                raw_roll = str(row[roll_col]).split('.')[0].strip() if pd.notna(row[roll_col]) else "Unknown"
-                score_val = row[pct_col]
-                if pd.isna(score_val): continue
+                # Strip trailing whitespace from IDs and Names
+                raw_roll = str(row[roll_col]).replace('\xa0', '').strip() if pd.notna(row[roll_col]) else "Unknown"
+                if raw_roll == "Unknown" or raw_roll == "nan": continue
+                
+                score_val = str(row[pct_col]).replace('\xa0', '').strip() if pd.notna(row[pct_col]) else None
+                if not score_val or score_val == "nan": continue
                     
                 status = "Present"
                 final_score = 0.0
-                if isinstance(score_val, str) and 'ABSENT' in score_val.upper(): status = "Absent"
+                if 'ABSENT' in score_val.upper(): status = "Absent"
                 else: 
                     try: final_score = float(score_val)
                     except: continue 
 
                 conduct = str(row[conduct_col]).strip().upper() if conduct_col and pd.notna(row[conduct_col]) else "GENUINE"
                 report_url = str(row[link_col]).strip() if link_col and pd.notna(row[link_col]) else ""
-                final_name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Unknown"
-                final_dept = str(row[dept_col]).strip() if dept_col and pd.notna(row[dept_col]) else "General"
-                final_sec = str(row[sec_col]).strip() if sec_col and pd.notna(row[sec_col]) else "General"
-                final_email = str(row[email_col]).strip() if email_col and pd.notna(row[email_col]) else ""
+                final_name = str(row[name_col]).replace('\xa0', '').strip() if name_col and pd.notna(row[name_col]) else "Unknown"
+                final_email = str(row[email_col]).replace('\xa0', '').strip() if email_col and pd.notna(row[email_col]) else ""
+
+                # Handle combined 'Branch and Section' column (e.g., 'CORE - A')
+                final_dept = "General"
+                final_sec = "General"
+                if combined_branch_sec_col and pd.notna(row[combined_branch_sec_col]):
+                    parts = str(row[combined_branch_sec_col]).split('-')
+                    final_dept = parts[0].strip()
+                    if len(parts) > 1: final_sec = parts[1].strip()
+                else:
+                    if dept_col and pd.notna(row[dept_col]): final_dept = str(row[dept_col]).strip()
+                    if sec_col and pd.notna(row[sec_col]): final_sec = str(row[sec_col]).strip()
 
                 student = db.query(StudentRoster).filter(StudentRoster.roll_no == raw_roll, StudentRoster.institute == institute).first()
                 if not student:
@@ -215,7 +231,6 @@ async def upload_feedback(institute: str = Form(...), files: List[UploadFile] = 
             diff_col = next((c for c in cols if any(x in str(c).lower() for x in ['issues', 'doubts', 'difficulties', 'comments'])), None)
             sugg_col = next((c for c in cols if 'suggestion' in str(c).lower() or 'improvement' in str(c).lower()), None)
 
-            # Auto-infer stack from filename if not inside columns
             fn_lower = file.filename.lower()
             inferred_stack = "General"
             if "cyber" in fn_lower: inferred_stack = "Cyber Security"
@@ -224,13 +239,11 @@ async def upload_feedback(institute: str = Form(...), files: List[UploadFile] = 
             elif "mern" in fn_lower: inferred_stack = "MERN Stack"
 
             for _, row in df.iterrows():
-                # Parse timestamp
                 parsed_ts = datetime.now()
                 if ts_col and pd.notna(row[ts_col]):
                     try: parsed_ts = pd.to_datetime(str(row[ts_col]))
                     except: pass
                 
-                # Parse rating (numeric 1-5 or string label)
                 num_rating = None
                 rating_lbl = ""
                 if rating_col and pd.notna(row[rating_col]):
