@@ -127,7 +127,6 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
             df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
             cols = df.columns
             
-            # UPDATED MAPPINGS FOR SRM FORMAT
             roll_col = next((c for c in cols if any(x in str(c).lower() for x in ['roll', 'prn', 'registration', 'register'])), None)
             if not roll_col: roll_col = next((c for c in cols if str(c).strip().lower() in ['id', 'student id']), None)
             pct_col = next((c for c in cols if 'percentage' in str(c).lower() or 'score' in str(c).lower()), None)
@@ -137,7 +136,6 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
             name_col = next((c for c in cols if 'name' in str(c).lower()), None)
             email_col = next((c for c in cols if 'email' in str(c).lower()), None)
             
-            # Detect standalone OR combined branch/section columns
             dept_col = next((c for c in cols if str(c).lower() in ['department', 'dept', 'branch']), None)
             sec_col = next((c for c in cols if 'section' in str(c).lower() and 'branch' not in str(c).lower()), None)
             combined_branch_sec_col = next((c for c in cols if 'branch' in str(c).lower() and 'section' in str(c).lower()), None)
@@ -152,7 +150,6 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                 except: pass
 
             for _, row in df.iterrows():
-                # Strip trailing whitespace from IDs and Names
                 raw_roll = str(row[roll_col]).replace('\xa0', '').strip() if pd.notna(row[roll_col]) else "Unknown"
                 if raw_roll == "Unknown" or raw_roll == "nan": continue
                 
@@ -171,7 +168,6 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                 final_name = str(row[name_col]).replace('\xa0', '').strip() if name_col and pd.notna(row[name_col]) else "Unknown"
                 final_email = str(row[email_col]).replace('\xa0', '').strip() if email_col and pd.notna(row[email_col]) else ""
 
-                # Handle combined 'Branch and Section' column (e.g., 'CORE - A')
                 final_dept = "General"
                 final_sec = "General"
                 if combined_branch_sec_col and pd.notna(row[combined_branch_sec_col]):
@@ -206,90 +202,109 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
 # ==========================================
 # TRAINER FEEDBACK DATA PIPELINE
 # ==========================================
+def process_feedback_dataframe(df: pd.DataFrame, source_name: str, institute: str, db: Session):
+    cols = df.columns
+    ts_col = next((c for c in cols if 'timestamp' in str(c).lower()), None)
+    name_col = next((c for c in cols if str(c).strip().lower() in ['name', 'participant name', 'student name']), None)
+    reg_col = next((c for c in cols if any(x in str(c).lower() for x in ['registration', 'roll', 'prn', 'reg'])), None)
+    sec_col = next((c for c in cols if 'section' in str(c).lower() or 'sec' in str(c).lower()), None)
+    trainer_col = next((c for c in cols if any(x in str(c).lower() for x in ['trainer name', 'trainer', 'instructor', 'faculty'])), None)
+    rating_col = next((c for c in cols if any(x in str(c).lower() for x in ['rate today', 'rating', 'score (1-5)'])), None)
+    und_col = next((c for c in cols if 'understand' in str(c).lower()), None)
+    clarity_col = next((c for c in cols if 'explain' in str(c).lower() or 'clarity' in str(c).lower() or 'recommend' in str(c).lower()), None)
+    pace_col = next((c for c in cols if 'pace' in str(c).lower()), None)
+    diff_col = next((c for c in cols if any(x in str(c).lower() for x in ['issues', 'doubts', 'difficulties', 'comments'])), None)
+    sugg_col = next((c for c in cols if 'suggestion' in str(c).lower() or 'improvement' in str(c).lower()), None)
+    stack_col = next((c for c in cols if 'stack' in str(c).lower() or 'course' in str(c).lower() or 'branch' in str(c).lower()), None)
+
+    fn_lower = source_name.lower()
+    inferred_stack = "General"
+    if "cyber" in fn_lower: inferred_stack = "Cyber Security"
+    elif "data science" in fn_lower or "dsml" in fn_lower: inferred_stack = "Data Science & ML"
+    elif "java" in fn_lower: inferred_stack = "Java Full Stack"
+    elif "mern" in fn_lower: inferred_stack = "MERN Stack"
+
+    count = 0
+    for _, row in df.iterrows():
+        parsed_ts = datetime.now()
+        if ts_col and pd.notna(row[ts_col]):
+            try: parsed_ts = pd.to_datetime(str(row[ts_col]))
+            except: pass
+        
+        num_rating = None
+        rating_lbl = ""
+        if rating_col and pd.notna(row[rating_col]):
+            val = row[rating_col]
+            try: num_rating = float(val)
+            except:
+                rating_lbl = str(val).strip()
+                if "excel" in rating_lbl.lower(): num_rating = 5.0
+                elif "good" in rating_lbl.lower(): num_rating = 4.0
+                elif "avg" in rating_lbl.lower() or "average" in rating_lbl.lower(): num_rating = 3.0
+                elif "poor" in rating_lbl.lower(): num_rating = 2.0
+                else: num_rating = 3.0
+
+        trainer = str(row[trainer_col]).strip() if trainer_col and pd.notna(row[trainer_col]) else "Assigned Faculty"
+        sec = str(row[sec_col]).strip() if sec_col and pd.notna(row[sec_col]) else "General"
+        st_name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Anonymous"
+        st_reg = str(row[reg_col]).strip() if reg_col and pd.notna(row[reg_col]) else ""
+        und = str(row[und_col]).strip() if und_col and pd.notna(row[und_col]) else ""
+        clarity = str(row[clarity_col]).strip() if clarity_col and pd.notna(row[clarity_col]) else ""
+        pace = str(row[pace_col]).strip() if pace_col and pd.notna(row[pace_col]) else ""
+        diff = str(row[diff_col]).strip() if diff_col and pd.notna(row[diff_col]) and str(row[diff_col]).lower() not in ['no', 'none', 'nil', 'nan', 'na', '.'] else ""
+        sugg = str(row[sugg_col]).strip() if sugg_col and pd.notna(row[sugg_col]) and str(row[sugg_col]).lower() not in ['no', 'none', 'nil', 'nan', 'na', '.'] else ""
+        
+        final_stack = inferred_stack
+        if stack_col and pd.notna(row[stack_col]): final_stack = str(row[stack_col]).strip()
+
+        db.add(TrainerFeedbackRecord(
+            institute=institute, submission_timestamp=parsed_ts, stack=final_stack, trainer_name=trainer,
+            section=sec, student_reg_no=st_reg, student_name=st_name, rating=num_rating, rating_label=rating_lbl,
+            understanding=und, clarity=clarity, pace=pace, difficulties=diff, suggestions=sugg, source_file=source_name
+        ))
+        count += 1
+    db.commit()
+    return count
+
 @app.post("/upload-feedback/")
 async def upload_feedback(institute: str = Form(...), files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
     if institute == "ALL": return {"message": "Error: Select a specific institute for feedback upload."}
     try:
-        total_feedback_added = 0
+        total = 0
         for file in files:
             if not file.filename.endswith(('.xlsx', '.xls', '.csv')): continue
             db.query(TrainerFeedbackRecord).filter(TrainerFeedbackRecord.source_file == file.filename, TrainerFeedbackRecord.institute == institute).delete()
             db.commit()
-
             df = pd.read_csv(io.BytesIO(await file.read())) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(await file.read()))
-            cols = df.columns
-            
-            ts_col = next((c for c in cols if 'timestamp' in str(c).lower()), None)
-            name_col = next((c for c in cols if str(c).strip().lower() in ['name', 'participant name', 'student name']), None)
-            reg_col = next((c for c in cols if any(x in str(c).lower() for x in ['registration', 'roll', 'prn', 'reg'])), None)
-            sec_col = next((c for c in cols if 'section' in str(c).lower() or 'sec' in str(c).lower()), None)
-            trainer_col = next((c for c in cols if any(x in str(c).lower() for x in ['trainer name', 'trainer', 'instructor', 'faculty'])), None)
-            rating_col = next((c for c in cols if any(x in str(c).lower() for x in ['rate today', 'rating', 'score (1-5)'])), None)
-            und_col = next((c for c in cols if 'understand' in str(c).lower()), None)
-            clarity_col = next((c for c in cols if 'explain' in str(c).lower() or 'clarity' in str(c).lower() or 'recommend' in str(c).lower()), None)
-            pace_col = next((c for c in cols if 'pace' in str(c).lower()), None)
-            diff_col = next((c for c in cols if any(x in str(c).lower() for x in ['issues', 'doubts', 'difficulties', 'comments'])), None)
-            sugg_col = next((c for c in cols if 'suggestion' in str(c).lower() or 'improvement' in str(c).lower()), None)
-
-            fn_lower = file.filename.lower()
-            inferred_stack = "General"
-            if "cyber" in fn_lower: inferred_stack = "Cyber Security"
-            elif "data science" in fn_lower or "dsml" in fn_lower: inferred_stack = "Data Science & ML"
-            elif "java" in fn_lower: inferred_stack = "Java Full Stack"
-            elif "mern" in fn_lower: inferred_stack = "MERN Stack"
-
-            for _, row in df.iterrows():
-                parsed_ts = datetime.now()
-                if ts_col and pd.notna(row[ts_col]):
-                    try: parsed_ts = pd.to_datetime(str(row[ts_col]))
-                    except: pass
-                
-                num_rating = None
-                rating_lbl = ""
-                if rating_col and pd.notna(row[rating_col]):
-                    val = row[rating_col]
-                    try:
-                        num_rating = float(val)
-                    except:
-                        rating_lbl = str(val).strip()
-                        if "excel" in rating_lbl.lower(): num_rating = 5.0
-                        elif "good" in rating_lbl.lower(): num_rating = 4.0
-                        elif "avg" in rating_lbl.lower() or "average" in rating_lbl.lower(): num_rating = 3.0
-                        elif "poor" in rating_lbl.lower(): num_rating = 2.0
-                        else: num_rating = 3.0
-
-                trainer = str(row[trainer_col]).strip() if trainer_col and pd.notna(row[trainer_col]) else "Assigned Faculty"
-                sec = str(row[sec_col]).strip() if sec_col and pd.notna(row[sec_col]) else "General"
-                st_name = str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else "Anonymous"
-                st_reg = str(row[reg_col]).strip() if reg_col and pd.notna(row[reg_col]) else ""
-                und = str(row[und_col]).strip() if und_col and pd.notna(row[und_col]) else ""
-                clarity = str(row[clarity_col]).strip() if clarity_col and pd.notna(row[clarity_col]) else ""
-                pace = str(row[pace_col]).strip() if pace_col and pd.notna(row[pace_col]) else ""
-                diff = str(row[diff_col]).strip() if diff_col and pd.notna(row[diff_col]) and str(row[diff_col]).lower() not in ['no', 'none', 'nil', 'nan', 'na', '.'] else ""
-                sugg = str(row[sugg_col]).strip() if sugg_col and pd.notna(row[sugg_col]) and str(row[sugg_col]).lower() not in ['no', 'none', 'nil', 'nan', 'na', '.'] else ""
-
-                db.add(TrainerFeedbackRecord(
-                    institute=institute,
-                    submission_timestamp=parsed_ts,
-                    stack=inferred_stack,
-                    trainer_name=trainer,
-                    section=sec,
-                    student_reg_no=st_reg,
-                    student_name=st_name,
-                    rating=num_rating,
-                    rating_label=rating_lbl,
-                    understanding=und,
-                    clarity=clarity,
-                    pace=pace,
-                    difficulties=diff,
-                    suggestions=sugg,
-                    source_file=file.filename
-                ))
-                total_feedback_added += 1
-            db.commit()
-        return {"message": f"Successfully ingested {total_feedback_added} trainer feedback records for {institute}!"}
+            total += process_feedback_dataframe(df, file.filename, institute, db)
+        return {"message": f"Successfully ingested {total} trainer feedback records for {institute}!"}
     except Exception as e:
         return {"message": f"Server Error: {str(e)}"}
+
+# --- NEW: LIVE GOOGLE SHEETS SYNC ENDPOINT ---
+@app.post("/api/sync-feedback/")
+def sync_live_feedback(institute: str, db: Session = Depends(get_db)):
+    config = db.query(CommunicationConfig).filter(CommunicationConfig.institute == institute).first()
+    if not config or not config.google_sheet_url:
+        return {"message": "Error: No Google Sheet URLs configured for this workspace."}
+    
+    urls = [url.strip() for url in config.google_sheet_url.split(',') if url.strip()]
+    if not urls: return {"message": "Error: Invalid URL format."}
+
+    try:
+        # Clear old Live Sheet data for this institute to prevent duplicates
+        db.query(TrainerFeedbackRecord).filter(TrainerFeedbackRecord.source_file.like("Live_Sheet_%"), TrainerFeedbackRecord.institute == institute).delete()
+        db.commit()
+
+        total = 0
+        for i, url in enumerate(urls):
+            source_name = f"Live_Sheet_{i+1}"
+            df = pd.read_csv(url)
+            total += process_feedback_dataframe(df, source_name, institute, db)
+        
+        return {"message": f"Successfully synced {total} live feedback responses from Google Sheets!"}
+    except Exception as e:
+        return {"message": f"Sync Failed. Ensure your Google Sheet is published as CSV. Error: {str(e)}"}
 
 @app.get("/api/feedbacks/")
 def get_feedbacks(institute: str, db: Session = Depends(get_db)):
