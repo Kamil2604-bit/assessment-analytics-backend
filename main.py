@@ -119,6 +119,11 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
     if institute == "ALL": return {"message": "Error: You must select a specific institute."}
     try:
         total_records_added = 0
+        
+        # OPTIMIZATION 1: Bulk fetch all existing students to prevent N+1 timeout crash
+        existing_students = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
+        student_map = {s.roll_no: s for s in existing_students}
+
         for file in files:
             if not file.filename.endswith(('.xlsx', '.xls', '.csv')): continue 
             db.query(AssessmentRecord).filter(AssessmentRecord.source_file == file.filename, AssessmentRecord.institute == institute).delete()
@@ -149,6 +154,9 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                     parsed_date = pd.to_datetime(date_str, format="%d/%m/%Y").date()
                 except: pass
 
+            # OPTIMIZATION 2: Store newly processed assessments in a list for bulk insert
+            new_assessments = []
+
             for _, row in df.iterrows():
                 raw_roll = str(row[roll_col]).replace('\xa0', '').strip() if pd.notna(row[roll_col]) else "Unknown"
                 if raw_roll == "Unknown" or raw_roll == "nan": continue
@@ -178,27 +186,32 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                     if dept_col and pd.notna(row[dept_col]): final_dept = str(row[dept_col]).strip()
                     if sec_col and pd.notna(row[sec_col]): final_sec = str(row[sec_col]).strip()
 
-                student = db.query(StudentRoster).filter(StudentRoster.roll_no == raw_roll, StudentRoster.institute == institute).first()
+                # High-speed memory lookup instead of a database query
+                student = student_map.get(raw_roll)
                 if not student:
                     student = StudentRoster(institute=institute, roll_no=raw_roll, name=final_name, department=final_dept, section=final_sec, email=final_email)
                     db.add(student)
+                    student_map[raw_roll] = student  # Save back to map immediately
                 else:
                     if final_name != "Unknown": student.name = final_name
                     if final_dept != "General": student.department = final_dept
                     if final_sec != "General": student.section = final_sec
                     if final_email and "@" in final_email: student.email = final_email
                 
-                db.add(AssessmentRecord(
+                new_assessments.append(AssessmentRecord(
                     institute=institute, roll_no=raw_roll, name=student.name, department=student.department,
                     section=student.section, assessment_date=parsed_date, score_percentage=final_score, status=status,
                     conduct_metrics=conduct, report_link=report_url, source_file=file.filename  
                 ))
                 total_records_added += 1
+            
+            # Commit the entire batch instantly
+            db.add_all(new_assessments)
             db.commit()
+            
         return {"message": f"Successfully processed {total_records_added} assessment records for {institute}!"}
     except Exception as e:
         return {"message": f"Server Error: {str(e)}"}
-
 # ==========================================
 # TRAINER FEEDBACK DATA PIPELINE
 # ==========================================
