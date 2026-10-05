@@ -67,11 +67,18 @@ def create_client(data: dict, db: Session = Depends(get_db)):
 # ==========================================
 @app.get("/api/uploaded-files/")
 def get_uploaded_files(institute: str, db: Session = Depends(get_db)):
-    assm_q = db.query(AssessmentRecord.source_file, func.count(AssessmentRecord.id)).group_by(AssessmentRecord.source_file)
-    fb_q = db.query(TrainerFeedbackRecord.source_file, func.count(TrainerFeedbackRecord.id)).group_by(TrainerFeedbackRecord.source_file)
+    # Create the base queries
+    assm_q = db.query(AssessmentRecord.source_file, func.count(AssessmentRecord.id))
+    fb_q = db.query(TrainerFeedbackRecord.source_file, func.count(TrainerFeedbackRecord.id))
+    
+    # APPLY FILTER FIRST (Strict Workspace Isolation)
     if institute != "ALL":
         assm_q = assm_q.filter(AssessmentRecord.institute == institute)
         fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
+        
+    # APPLY GROUPING SECOND
+    assm_q = assm_q.group_by(AssessmentRecord.source_file)
+    fb_q = fb_q.group_by(TrainerFeedbackRecord.source_file)
     
     files = [{"filename": str(r[0]), "record_count": r[1], "type": "Assessment"} for r in assm_q.all() if r[0]]
     files.extend([{"filename": str(r[0]), "record_count": r[1], "type": "Feedback"} for r in fb_q.all() if r[0]])
