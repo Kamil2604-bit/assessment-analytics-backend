@@ -7,6 +7,7 @@ from typing import List
 import pandas as pd
 import io
 import smtplib
+import math
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -72,20 +73,39 @@ def get_uploaded_files(institute: str, db: Session = Depends(get_db)):
         assm_q = assm_q.filter(AssessmentRecord.institute == institute)
         fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
     
-    files = [{"filename": r[0], "record_count": r[1], "type": "Assessment"} for r in assm_q.all() if r[0]]
-    files.extend([{"filename": r[0], "record_count": r[1], "type": "Feedback"} for r in fb_q.all() if r[0]])
+    files = [{"filename": str(r[0]), "record_count": r[1], "type": "Assessment"} for r in assm_q.all() if r[0]]
+    files.extend([{"filename": str(r[0]), "record_count": r[1], "type": "Feedback"} for r in fb_q.all() if r[0]])
     return files
 
 @app.get("/api/assessments/")
 def get_all_assessments(institute: str, db: Session = Depends(get_db)):
     query = db.query(AssessmentRecord)
     if institute != "ALL": query = query.filter(AssessmentRecord.institute == institute)
-    records = query.all()
-    return [{ 
-        "Roll No": r.roll_no, "Name": r.name, "Department": r.department, "Section": r.section or "General",
-        "Date": r.assessment_date.strftime("%Y-%m-%d"), "Score": r.score_percentage, 
-        "Status": r.status, "Conduct": r.conduct_metrics, "Link": r.report_link 
-    } for r in records]
+    
+    output = []
+    for r in query.all():
+        # Sanitize score to prevent JavaScript NaN crashes
+        score = r.score_percentage if r.score_percentage is not None else 0.0
+        if math.isnan(score) or math.isinf(score): score = 0.0
+        
+        # Sanitize date to prevent strftime AttributeError
+        date_str = "Unknown"
+        if r.assessment_date:
+            try: date_str = r.assessment_date.strftime("%Y-%m-%d")
+            except: pass
+            
+        output.append({ 
+            "Roll No": str(r.roll_no) if r.roll_no else "Unknown", 
+            "Name": str(r.name) if r.name else "Unknown", 
+            "Department": str(r.department) if r.department else "General", 
+            "Section": str(r.section) if r.section else "General",
+            "Date": date_str, 
+            "Score": round(score, 2), 
+            "Status": str(r.status) if r.status else "Present", 
+            "Conduct": str(r.conduct_metrics) if r.conduct_metrics else "GENUINE", 
+            "Link": str(r.report_link) if r.report_link else "" 
+        })
+    return output
 
 @app.delete("/api/delete-file/{filename}")
 def delete_file_records(filename: str, institute: str, db: Session = Depends(get_db)):
@@ -120,7 +140,7 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
     try:
         total_records_added = 0
         
-        # OPTIMIZATION 1: Bulk fetch all existing students to prevent N+1 timeout crash
+        # In-memory dictionary for hyper-fast lookups (prevents timeouts)
         existing_students = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
         student_map = {s.roll_no: s for s in existing_students}
 
@@ -154,7 +174,6 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                     parsed_date = pd.to_datetime(date_str, format="%d/%m/%Y").date()
                 except: pass
 
-            # OPTIMIZATION 2: Store newly processed assessments in a list for bulk insert
             new_assessments = []
 
             for _, row in df.iterrows():
@@ -162,13 +181,15 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                 if raw_roll == "Unknown" or raw_roll == "nan": continue
                 
                 score_val = str(row[pct_col]).replace('\xa0', '').strip() if pd.notna(row[pct_col]) else None
-                if not score_val or score_val == "nan": continue
+                if not score_val or score_val.lower() == "nan": continue
                     
                 status = "Present"
                 final_score = 0.0
                 if 'ABSENT' in score_val.upper(): status = "Absent"
                 else: 
-                    try: final_score = float(score_val)
+                    try: 
+                        final_score = float(score_val)
+                        if math.isnan(final_score) or math.isinf(final_score): final_score = 0.0
                     except: continue 
 
                 conduct = str(row[conduct_col]).strip().upper() if conduct_col and pd.notna(row[conduct_col]) else "GENUINE"
@@ -186,12 +207,11 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                     if dept_col and pd.notna(row[dept_col]): final_dept = str(row[dept_col]).strip()
                     if sec_col and pd.notna(row[sec_col]): final_sec = str(row[sec_col]).strip()
 
-                # High-speed memory lookup instead of a database query
                 student = student_map.get(raw_roll)
                 if not student:
                     student = StudentRoster(institute=institute, roll_no=raw_roll, name=final_name, department=final_dept, section=final_sec, email=final_email)
                     db.add(student)
-                    student_map[raw_roll] = student  # Save back to map immediately
+                    student_map[raw_roll] = student
                 else:
                     if final_name != "Unknown": student.name = final_name
                     if final_dept != "General": student.department = final_dept
@@ -205,7 +225,6 @@ async def upload_assessment(institute: str = Form(...), files: List[UploadFile] 
                 ))
                 total_records_added += 1
             
-            # Commit the entire batch instantly
             db.add_all(new_assessments)
             db.commit()
             
