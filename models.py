@@ -3,25 +3,22 @@ from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Fetch Database URL from environment (Render/Neon), fallback to local SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./saas_analytics.db")
 
-# Fix legacy Postgres URI prefix if present for SQLAlchemy 2.0+ compatibility
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Configure engine with connection health checks to prevent serverless DB hangs
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(
-        DATABASE_URL, 
+        DATABASE_URL,
         connect_args={"check_same_thread": False}
     )
 else:
     engine = create_engine(
         DATABASE_URL,
-        pool_pre_ping=True,   # Validates connection before every query
-        pool_recycle=300,     # Refreshes idle connections every 5 minutes
-        pool_size=5,          # Keeps memory footprint low for Render 512MB limit
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=5,
         max_overflow=0
     )
 
@@ -66,6 +63,25 @@ class AssessmentRecord(Base):
     source_file = Column(String, index=True)
 
 
+class AttendanceRecord(Base):
+    __tablename__ = "attendance_records"
+    id = Column(Integer, primary_key=True, index=True)
+    institute = Column(String, index=True)
+    roll_no = Column(String, index=True)
+    name = Column(String)
+    contact = Column(String, default="")
+    email = Column(String, default="")
+    department = Column(String, index=True)
+    section = Column(String, index=True)
+    session_date = Column(Date, index=True)
+    session_slot = Column(String)
+    session_label = Column(String)
+    is_conducted = Column(Integer, default=1)  # 1 = Conducted, 0 = Holiday / Cancelled
+    status = Column(String)                    # Present, OD, Absent, Mass Bunk, No Class
+    cancel_reason = Column(Text, default="")   # e.g. Holiday (Rakshabandhan), Industrial Visit
+    source_file = Column(String, index=True)
+
+
 class TrainerFeedbackRecord(Base):
     __tablename__ = "trainer_feedback_records"
     id = Column(Integer, primary_key=True, index=True)
@@ -99,5 +115,4 @@ class CommunicationConfig(Base):
     google_sheet_url = Column(Text, default="")
 
 
-# Automatically create tables if they don't exist
 Base.metadata.create_all(bind=engine)
