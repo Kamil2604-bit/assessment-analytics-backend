@@ -7,6 +7,7 @@ from typing import List
 import pandas as pd
 import io
 import math
+import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -15,6 +16,7 @@ from email.mime.application import MIMEApplication
 from models import (
     SessionLocal,
     AssessmentRecord,
+    AttendanceRecord,
     StudentRoster,
     ClientAccount,
     CommunicationConfig,
@@ -43,14 +45,12 @@ def get_db():
 def startup_event():
     db = SessionLocal()
     try:
-        # Provision Default Super Admin & Client Admin Accounts
         super_admin = db.query(ClientAccount).filter(ClientAccount.username == "admin").first()
         if not super_admin:
             db.add(ClientAccount(username="admin", password="Admin@123", role="super_admin", institute="ALL", display_name="Super Admin"))
             db.add(ClientAccount(username="gniot_admin", password="Gniot@123", role="client_admin", institute="GNIOT", display_name="GNIOT"))
             db.add(ClientAccount(username="srm_admin", password="Srm@123", role="client_admin", institute="SRM", display_name="SRM"))
 
-        # Provision Default View-Only Guest POC Accounts
         if not db.query(ClientAccount).filter(ClientAccount.username == "srm_guest").first():
             db.add(ClientAccount(username="srm_guest", password="Srm@View123", role="client_user", institute="SRM", display_name="SRM"))
         if not db.query(ClientAccount).filter(ClientAccount.username == "gniot_guest").first():
@@ -62,7 +62,7 @@ def startup_event():
 
 
 # ==========================================
-# AUTH & CLIENT MANAGEMENT
+# AUTH & CLIENT CREDENTIALS MANAGER
 # ==========================================
 @app.post("/api/login")
 def login_user(data: dict, db: Session = Depends(get_db)):
@@ -87,48 +87,120 @@ def get_institutes(db: Session = Depends(get_db)):
 
 
 @app.post("/api/create-client/")
-def create_client(data: dict, db: Session = Depends(get_db)):
-    existing = db.query(ClientAccount).filter(ClientAccount.username == data.get("username")).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Username already exists!")
-
+def create_or_update_client(data: dict, db: Session = Depends(get_db)):
+    uname = str(data.get("username", "")).strip()
+    pwd = str(data.get("password", "")).strip()
+    inst_clean = str(data.get("institute", "")).upper().strip()
     assigned_role = data.get("role", "client_admin")
-    inst_clean = str(data.get("institute")).upper().strip()
+
+    if not uname or not pwd or not inst_clean:
+        raise HTTPException(status_code=400, detail="All fields are required.")
+
+    existing = db.query(ClientAccount).filter(ClientAccount.username == uname).first()
+    role_label = "View-Only Guest POC" if assigned_role == "client_user" else "Client Admin"
+
+    if existing:
+        existing.password = pwd
+        existing.institute = inst_clean
+        existing.display_name = inst_clean
+        existing.role = assigned_role
+        db.commit()
+        return {"message": f"Updated credentials! '{uname}' ({inst_clean}) now has the new password and role ({role_label})."}
 
     new_client = ClientAccount(
-        username=str(data.get("username")).strip(),
-        password=str(data.get("password")).strip(),
+        username=uname,
+        password=pwd,
         role=assigned_role,
         institute=inst_clean,
         display_name=inst_clean,
     )
     db.add(new_client)
     db.commit()
-    role_label = "View-Only Guest POC" if assigned_role == "client_user" else "Client Admin"
-    return {"message": f"Successfully created {role_label} account '{new_client.username}' for {inst_clean}!"}
+    return {"message": f"Successfully created {role_label} account '{uname}' for {inst_clean}!"}
+
+
+@app.get("/api/accounts/")
+def get_all_accounts(db: Session = Depends(get_db)):
+    accounts = db.query(ClientAccount).filter(ClientAccount.username != "admin").all()
+    return [{
+        "username": a.username,
+        "password": a.password,
+        "institute": a.institute,
+        "role": "Guest POC (View Only)" if a.role == "client_user" else "Client Admin"
+    } for a in accounts]
+
+
+@app.delete("/api/accounts/{username}")
+def delete_account(username: str, db: Session = Depends(get_db)):
+    if username == "admin":
+        raise HTTPException(status_code=400, detail="Cannot delete Super Admin.")
+    db.query(ClientAccount).filter(ClientAccount.username == username).delete()
+    db.commit()
+    return {"message": f"Account '{username}' has been revoked and deleted."}
 
 
 # ==========================================
-# ASSESSMENT DATA PIPELINE
+# FILE MANAGEMENT GATEWAY
 # ==========================================
 @app.get("/api/uploaded-files/")
 def get_uploaded_files(institute: str, db: Session = Depends(get_db)):
     assm_q = db.query(AssessmentRecord.source_file, func.count(AssessmentRecord.id))
     fb_q = db.query(TrainerFeedbackRecord.source_file, func.count(TrainerFeedbackRecord.id))
+    att_q = db.query(AttendanceRecord.source_file, func.count(AttendanceRecord.id))
 
-    # Strict Workspace Isolation: Filter BEFORE grouping
     if institute != "ALL":
         assm_q = assm_q.filter(AssessmentRecord.institute == institute)
         fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
+        att_q = att_q.filter(AttendanceRecord.institute == institute)
 
     assm_q = assm_q.group_by(AssessmentRecord.source_file)
     fb_q = fb_q.group_by(TrainerFeedbackRecord.source_file)
+    att_q = att_q.group_by(AttendanceRecord.source_file)
 
     files = [{"filename": str(r[0]), "record_count": r[1], "type": "Assessment"} for r in assm_q.all() if r[0]]
     files.extend([{"filename": str(r[0]), "record_count": r[1], "type": "Feedback"} for r in fb_q.all() if r[0]])
+    files.extend([{"filename": str(r[0]), "record_count": r[1], "type": "Attendance"} for r in att_q.all() if r[0]])
     return files
 
 
+@app.delete("/api/delete-file/{filename}")
+def delete_file_records(filename: str, institute: str, db: Session = Depends(get_db)):
+    assm_q = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename)
+    fb_q = db.query(TrainerFeedbackRecord).filter(TrainerFeedbackRecord.source_file == filename)
+    att_q = db.query(AttendanceRecord).filter(AttendanceRecord.source_file == filename)
+    if institute != "ALL":
+        assm_q = assm_q.filter(AssessmentRecord.institute == institute)
+        fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
+        att_q = att_q.filter(AttendanceRecord.institute == institute)
+    d1 = assm_q.delete()
+    d2 = fb_q.delete()
+    d3 = att_q.delete()
+    db.commit()
+    return {"message": f"Successfully deleted '{filename}' ({d1 + d2 + d3} records removed)."}
+
+
+@app.delete("/api/reset-database/")
+def reset_database(institute: str, db: Session = Depends(get_db)):
+    q1 = db.query(AssessmentRecord)
+    q2 = db.query(TrainerFeedbackRecord)
+    q3 = db.query(StudentRoster)
+    q4 = db.query(AttendanceRecord)
+    if institute != "ALL":
+        q1 = q1.filter(AssessmentRecord.institute == institute)
+        q2 = q2.filter(TrainerFeedbackRecord.institute == institute)
+        q3 = q3.filter(StudentRoster.institute == institute)
+        q4 = q4.filter(AttendanceRecord.institute == institute)
+    d1 = q1.delete()
+    d2 = q2.delete()
+    d3 = q3.delete()
+    d4 = q4.delete()
+    db.commit()
+    return {"message": f"Reset Complete! Cleared {d1} assessments, {d4} attendance logs, {d2} feedback records, and {d3} roster entries."}
+
+
+# ==========================================
+# ASSESSMENT DATA PIPELINE
+# ==========================================
 @app.get("/api/assessments/")
 def get_all_assessments(institute: str, db: Session = Depends(get_db)):
     query = db.query(AssessmentRecord)
@@ -162,43 +234,12 @@ def get_all_assessments(institute: str, db: Session = Depends(get_db)):
     return output
 
 
-@app.delete("/api/delete-file/{filename}")
-def delete_file_records(filename: str, institute: str, db: Session = Depends(get_db)):
-    assm_q = db.query(AssessmentRecord).filter(AssessmentRecord.source_file == filename)
-    fb_q = db.query(TrainerFeedbackRecord).filter(TrainerFeedbackRecord.source_file == filename)
-    if institute != "ALL":
-        assm_q = assm_q.filter(AssessmentRecord.institute == institute)
-        fb_q = fb_q.filter(TrainerFeedbackRecord.institute == institute)
-    d1 = assm_q.delete()
-    d2 = fb_q.delete()
-    db.commit()
-    return {"message": f"Successfully deleted '{filename}' ({d1 + d2} records removed)."}
-
-
-@app.delete("/api/reset-database/")
-def reset_database(institute: str, db: Session = Depends(get_db)):
-    q1 = db.query(AssessmentRecord)
-    q2 = db.query(TrainerFeedbackRecord)
-    q3 = db.query(StudentRoster)
-    if institute != "ALL":
-        q1 = q1.filter(AssessmentRecord.institute == institute)
-        q2 = q2.filter(TrainerFeedbackRecord.institute == institute)
-        q3 = q3.filter(StudentRoster.institute == institute)
-    d1 = q1.delete()
-    d2 = q2.delete()
-    d3 = q3.delete()
-    db.commit()
-    return {"message": f"Reset Complete! Cleared {d1} assessments, {d2} feedback records, and {d3} roster entries."}
-
-
 @app.post("/upload-assessment/")
 def upload_assessment(institute: str = Form(...), files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
     if institute == "ALL":
         return {"message": "Error: You must select a specific institute."}
     try:
         total_records_added = 0
-
-        # Bulk fetch all existing students into memory to prevent N+1 query timeouts
         existing_students = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
         student_map = {s.roll_no: s for s in existing_students}
 
@@ -211,7 +252,6 @@ def upload_assessment(institute: str = Form(...), files: List[UploadFile] = File
             ).delete()
             db.commit()
 
-            # Read directly from file stream to keep RAM usage minimal on Render
             file.file.seek(0)
             df = pd.read_csv(file.file) if file.filename.endswith('.csv') else pd.read_excel(file.file)
             cols = df.columns
@@ -242,7 +282,6 @@ def upload_assessment(institute: str = Form(...), files: List[UploadFile] = File
                     pass
 
             new_assessments = []
-
             for _, row in df.iterrows():
                 raw_roll = str(row[roll_col]).replace('\xa0', '').strip() if pd.notna(row[roll_col]) else "Unknown"
                 if raw_roll == "Unknown" or raw_roll.lower() == "nan":
@@ -325,6 +364,279 @@ def upload_assessment(institute: str = Form(...), files: List[UploadFile] = File
         return {"message": f"Successfully processed {total_records_added} assessment records for {institute}!"}
     except Exception as e:
         return {"message": f"Server Error: {str(e)}"}
+
+
+# ==========================================
+# MULTI-SHEET ATTENDANCE & CERTIFICATION PIPELINE
+# ==========================================
+def infer_department_from_section(sec_name: str, filename: str) -> str:
+    s_up = sec_name.upper()
+    f_up = filename.upper()
+    if "CORE" in s_up or "CORE" in f_up:
+        return "CSE CORE"
+    if "AIML" in s_up or "AIML" in f_up:
+        return "CSE AIML"
+    if any(k in s_up for k in ["DS", "CC", "CS"]) or "DSBS" in f_up:
+        return "DSBS"
+    return "General"
+
+
+def process_attendance_sheet(df: pd.DataFrame, sheet_name: str, filename: str, institute: str, db: Session, student_map: dict) -> int:
+    cols = list(df.columns)
+    if len(cols) < 5:
+        return 0
+
+    reg_col = next((c for c in cols if any(x in str(c).lower() for x in ['register', 'registration', 'roll', 'prn'])), cols[1])
+    name_col = next((c for c in cols if 'name' in str(c).lower()), cols[2])
+    contact_col = next((c for c in cols if 'contact' in str(c).lower() or 'phone' in str(c).lower()), cols[3] if len(cols) > 3 else None)
+    email_col = next((c for c in cols if 'mail' in str(c).lower()), cols[4] if len(cols) > 4 else None)
+
+    dept_name = infer_department_from_section(sheet_name, filename)
+    sec_clean = sheet_name.strip()
+
+    # Identify all session date columns (skip inline 'Percentage (...)' columns)
+    session_cols = []
+    for c in cols[5:]:
+        c_str = str(c).strip()
+        if "percentage" in c_str.lower() or "total" in c_str.lower() or "unnamed" in c_str.lower():
+            continue
+        m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', c_str)
+        if m:
+            raw_date_str = m.group(1)
+            try:
+                s_date = pd.to_datetime(raw_date_str, format="%d/%m/%Y").date()
+            except Exception:
+                continue
+            lines = [line.strip() for line in c_str.split('\n') if line.strip()]
+            s_slot = lines[1] if len(lines) > 1 else "Regular Slot"
+            s_label = f"{s_date.strftime('%Y-%m-%d')} ({s_slot})"
+            session_cols.append((c, s_date, s_slot, s_label))
+
+    if not session_cols:
+        return 0
+
+    # Filter valid student rows (exclude bottom TOTAL / NaN summary rows)
+    valid_rows = []
+    for _, row in df.iterrows():
+        raw_reg = str(row[reg_col]).replace('\xa0', '').strip() if pd.notna(row[reg_col]) else ""
+        if not raw_reg or raw_reg.lower() in ["nan", "none", "total", "total:"]:
+            continue
+        if not any(ch.isdigit() for ch in raw_reg):
+            continue
+        valid_rows.append((raw_reg, row))
+
+    if not valid_rows:
+        return 0
+
+    # Pre-analyze each session column to determine if it was Conducted (1) or Cancelled/Holiday (0)
+    col_meta = {}
+    for c, s_date, s_slot, s_label in session_cols:
+        raw_vals = []
+        for _, row in valid_rows:
+            v = row[c]
+            if pd.notna(v):
+                s_v = str(v).replace('\xa0', '').replace('`', '').strip()
+                if s_v != "":
+                    raw_vals.append(s_v)
+
+        has_normal_marks = False
+        text_reasons = []
+        for sv in raw_vals:
+            sv_up = sv.upper()
+            if sv_up in ['1', '1.0', '0', '0.0', 'OD', 'P', 'A']:
+                has_normal_marks = True
+            elif 'MASS BUNK' in sv_up:
+                has_normal_marks = True
+            else:
+                try:
+                    float(sv)
+                    has_normal_marks = True
+                except Exception:
+                    text_reasons.append(sv)
+
+        if not has_normal_marks and text_reasons:
+            # Entire column is a Holiday / Industrial Visit / Cancelled Session
+            col_meta[c] = (0, text_reasons[0])
+        else:
+            col_meta[c] = (1, "")
+
+    new_records = []
+    for raw_reg, row in valid_rows:
+        st_name = str(row[name_col]).replace('\xa0', '').strip() if name_col and pd.notna(row[name_col]) else "Unknown"
+        st_contact = str(row[contact_col]).replace('\xa0', '').strip() if contact_col and pd.notna(row[contact_col]) else ""
+        if st_contact.endswith(".0"):
+            st_contact = st_contact[:-2]
+        st_email = str(row[email_col]).replace('\xa0', '').strip() if email_col and pd.notna(row[email_col]) else ""
+
+        student = student_map.get(raw_reg)
+        if not student:
+            student = StudentRoster(
+                institute=institute,
+                roll_no=raw_reg,
+                name=st_name,
+                department=dept_name,
+                section=sec_clean,
+                email=st_email,
+            )
+            db.add(student)
+            student_map[raw_reg] = student
+        else:
+            if st_email and "@" in st_email:
+                student.email = st_email
+
+        for c, s_date, s_slot, s_label in session_cols:
+            is_cond, default_reason = col_meta[c]
+            val = row[c]
+            s_val = str(val).replace('\xa0', '').replace('`', '').strip() if pd.notna(val) else ""
+            s_up = s_val.upper()
+
+            if is_cond == 0:
+                status = "No Class"
+                reason = s_val if s_val else default_reason
+            else:
+                if s_up in ['1', '1.0', 'P']:
+                    status = "Present"
+                    reason = ""
+                elif s_up == 'OD':
+                    status = "OD"  # Counted as Present in analytics
+                    reason = "On Duty (OD)"
+                elif 'MASS BUNK' in s_up:
+                    status = "Mass Bunk"  # Counted as Absent in analytics
+                    reason = "Mass Bunk"
+                elif s_up in ['0', '0.0', 'A', '']:
+                    status = "Absent"
+                    reason = ""
+                else:
+                    try:
+                        num_v = float(s_val)
+                        status = "Present" if num_v >= 1.0 else "Absent"
+                        reason = ""
+                    except Exception:
+                        # Row-level holiday/cancel text
+                        is_cond = 0
+                        status = "No Class"
+                        reason = s_val
+
+            new_records.append(AttendanceRecord(
+                institute=institute,
+                roll_no=raw_reg,
+                name=st_name,
+                contact=st_contact,
+                email=st_email,
+                department=dept_name,
+                section=sec_clean,
+                session_date=s_date,
+                session_slot=s_slot,
+                session_label=s_label,
+                is_conducted=is_cond,
+                status=status,
+                cancel_reason=reason,
+                source_file=filename,
+            ))
+
+    db.bulk_save_objects(new_records)
+    db.commit()
+    return len(new_records)
+
+
+@app.post("/upload-attendance/")
+def upload_attendance(institute: str = Form(...), files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+    if institute == "ALL":
+        return {"message": "Error: Please select a specific institute workspace."}
+    try:
+        total_cells = 0
+        total_sheets = 0
+        existing_students = db.query(StudentRoster).filter(StudentRoster.institute == institute).all()
+        student_map = {s.roll_no: s for s in existing_students}
+
+        for file in files:
+            if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
+                continue
+            db.query(AttendanceRecord).filter(
+                AttendanceRecord.source_file == file.filename,
+                AttendanceRecord.institute == institute
+            ).delete()
+            db.commit()
+
+            file.file.seek(0)
+            if file.filename.endswith('.csv'):
+                df = pd.read_csv(file.file)
+                sec_guess = file.filename.rsplit('.', 1)[0]
+                total_cells += process_attendance_sheet(df, sec_guess, file.filename, institute, db, student_map)
+                total_sheets += 1
+            else:
+                xls = pd.ExcelFile(file.file)
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name)
+                    added = process_attendance_sheet(df, sheet_name, file.filename, institute, db, student_map)
+                    if added > 0:
+                        total_cells += added
+                        total_sheets += 1
+
+        return {"message": f"Successfully processed {total_sheets} section sheets ({total_cells} session logs) for {institute}!"}
+    except Exception as e:
+        return {"message": f"Attendance Upload Error: {str(e)}"}
+
+
+@app.get("/api/attendance/")
+def get_attendance_data(institute: str, db: Session = Depends(get_db)):
+    query = db.query(AttendanceRecord)
+    if institute != "ALL":
+        query = query.filter(AttendanceRecord.institute == institute)
+
+    records = query.all()
+    if not records:
+        return {"students": [], "sessions": [], "logs": []}
+
+    # Compact payload structure so 35,000+ session logs transfer in <0.5 seconds
+    students_dict = {}
+    sessions_dict = {}
+    logs_list = []
+
+    for r in records:
+        if r.roll_no not in students_dict:
+            students_dict[r.roll_no] = {
+                "roll": r.roll_no,
+                "name": r.name,
+                "contact": r.contact or "-",
+                "email": r.email or "-",
+                "dept": r.department,
+                "sec": r.section,
+            }
+        date_str = r.session_date.strftime("%Y-%m-%d") if r.session_date else "Unknown"
+        sess_key = f"{r.section}||{date_str}||{r.session_slot}"
+        if sess_key not in sessions_dict:
+            sessions_dict[sess_key] = {
+                "key": sess_key,
+                "dept": r.department,
+                "sec": r.section,
+                "date": date_str,
+                "slot": r.session_slot,
+                "label": r.session_label,
+                "conducted": r.is_conducted,
+                "reason": r.cancel_reason or "",
+            }
+        elif r.cancel_reason and not sessions_dict[sess_key]["reason"]:
+            sessions_dict[sess_key]["reason"] = r.cancel_reason
+
+        # Status codes: P=Present, OD=On Duty (Present), A=Absent, MB=Mass Bunk (Absent), NC=No Class
+        short_st = "P"
+        if r.status == "OD":
+            short_st = "OD"
+        elif r.status == "Absent":
+            short_st = "A"
+        elif r.status == "Mass Bunk":
+            short_st = "MB"
+        elif r.status == "No Class" or r.is_conducted == 0:
+            short_st = "NC"
+
+        logs_list.append([r.roll_no, sess_key, short_st])
+
+    return {
+        "students": list(students_dict.values()),
+        "sessions": list(sessions_dict.values()),
+        "logs": logs_list,
+    }
 
 
 # ==========================================
