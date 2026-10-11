@@ -21,7 +21,7 @@ from models import (
     TrainerFeedbackRecord,
 )
 
-app = FastAPI(title="Master SaaS Analytics Engine")
+app = FastAPI(title="BENCHMARK. Academic Intelligence & Performance Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,12 +43,20 @@ def get_db():
 def startup_event():
     db = SessionLocal()
     try:
+        # Provision Default Super Admin & Client Admin Accounts
         super_admin = db.query(ClientAccount).filter(ClientAccount.username == "admin").first()
         if not super_admin:
             db.add(ClientAccount(username="admin", password="Admin@123", role="super_admin", institute="ALL", display_name="Super Admin"))
             db.add(ClientAccount(username="gniot_admin", password="Gniot@123", role="client_admin", institute="GNIOT", display_name="GNIOT"))
             db.add(ClientAccount(username="srm_admin", password="Srm@123", role="client_admin", institute="SRM", display_name="SRM"))
-            db.commit()
+
+        # Provision Default View-Only Guest POC Accounts
+        if not db.query(ClientAccount).filter(ClientAccount.username == "srm_guest").first():
+            db.add(ClientAccount(username="srm_guest", password="Srm@View123", role="client_user", institute="SRM", display_name="SRM"))
+        if not db.query(ClientAccount).filter(ClientAccount.username == "gniot_guest").first():
+            db.add(ClientAccount(username="gniot_guest", password="Gniot@View123", role="client_user", institute="GNIOT", display_name="GNIOT"))
+
+        db.commit()
     finally:
         db.close()
 
@@ -83,16 +91,21 @@ def create_client(data: dict, db: Session = Depends(get_db)):
     existing = db.query(ClientAccount).filter(ClientAccount.username == data.get("username")).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username already exists!")
+
+    assigned_role = data.get("role", "client_admin")
+    inst_clean = str(data.get("institute")).upper().strip()
+
     new_client = ClientAccount(
-        username=data.get("username"),
-        password=data.get("password"),
-        role="client_admin",
-        institute=str(data.get("institute")).upper().strip(),
-        display_name=str(data.get("institute")).upper().strip(),
+        username=str(data.get("username")).strip(),
+        password=str(data.get("password")).strip(),
+        role=assigned_role,
+        institute=inst_clean,
+        display_name=inst_clean,
     )
     db.add(new_client)
     db.commit()
-    return {"message": f"Successfully created workspace for {new_client.institute}!"}
+    role_label = "View-Only Guest POC" if assigned_role == "client_user" else "Client Admin"
+    return {"message": f"Successfully created {role_label} account '{new_client.username}' for {inst_clean}!"}
 
 
 # ==========================================
@@ -596,7 +609,7 @@ def trigger_automated_emails(institute: str, target_date: str = None, db: Sessio
             msg['From'] = config.sender_email
             msg['To'] = student.email
             msg['Cc'] = config.cc_emails
-            msg['Subject'] = f"[{institute}] Automated Performance Scorecard"
+            msg['Subject'] = f"[{institute}] BENCHMARK Performance Scorecard"
             msg.attach(MIMEText(custom_message, 'plain'))
 
             output = io.BytesIO()
